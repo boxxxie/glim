@@ -53,6 +53,7 @@ impl StatefulWidget for ProjectsTable<'_> {
                 ("q", "quit"),
                 ("w", "open web"),
                 ("c", "config"),
+                ("m", "mr activity"),
                 ("a", "last notification"),
                 ("f/", "filter"),
                 ("r", "refresh"),

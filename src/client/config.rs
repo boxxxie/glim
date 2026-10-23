@@ -261,9 +261,14 @@ impl ClientConfig {
 
 impl From<GlimConfig> for ClientConfig {
     fn from(config: GlimConfig) -> Self {
+        let polling = PollingConfig {
+            projects_interval: Duration::from_secs(config.projects_poll_seconds.max(3)),
+            jobs_interval: Duration::from_secs(config.jobs_poll_seconds.max(3)),
+        };
         Self::new(config.gitlab_url, config.gitlab_token)
             .with_search_filter(config.search_filter)
             .with_max_age_days(config.max_age_days)
+            .with_polling(polling)
     }
 }
 

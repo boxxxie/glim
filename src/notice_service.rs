@@ -103,6 +103,9 @@ impl NoticeService {
                 NoticeLevel::Info,
                 NoticeMessage::LogLevelChanged(*new_level),
             ),
+            GlimEvent::ActivityNotice(msg) => {
+                self.push_notice(NoticeLevel::Info, NoticeMessage::GeneralMessage(msg.clone()))
+            },
             _ => {},
         }
     }

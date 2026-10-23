@@ -1,25 +1,43 @@
-use std::{collections::HashMap, sync::mpsc::Sender};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::mpsc::Sender,
+};
 
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
     dispatcher::Dispatcher,
-    domain::{Job, Pipeline, Project},
+    domain::{
+        clean_note_body, ActivityKind, GitlabEventDto, Job, MergeRequest, Pipeline, PipelineStatus,
+        Project, ProjectActivityEvent,
+    },
     event::GlimEvent,
     glim_app::GlimConfig,
     id::ProjectId,
+    os_notify::{send_os_notification, NotifyUrgency},
 };
+
+const MAX_ACTIVITY_EVENTS: usize = 50;
 
 pub struct ProjectStore {
     sender: Sender<GlimEvent>,
     projects: Vec<Project>,
     project_id_lookup: HashMap<ProjectId, usize>,
-    sorted: Vec<Project>, // todo: ref projects
+    sorted: Vec<Project>,
     max_recent_pipelines: usize,
     include_mr_pipelines: bool,
     auto_fetch_days: i64,
+    os_notifications: bool,
+    ignore_bot_comments: bool,
+    include_projects: Option<Vec<CompactString>>,
+    exclude_projects: Option<Vec<CompactString>>,
+    hydrated_pipelines: HashSet<ProjectId>,
+    hydrated_mrs: HashSet<ProjectId>,
+    last_seen_event_id: HashMap<ProjectId, u64>,
+    recent_activity: Vec<ProjectActivityEvent>,
 }
 
 impl ProjectStore {
@@ -28,13 +46,63 @@ impl ProjectStore {
         Self {
             sender,
             projects: Vec::new(),
-            // pipelines: Vec::new(),
             project_id_lookup: HashMap::new(),
             sorted: Vec::new(),
             max_recent_pipelines: config.max_recent_pipelines,
             include_mr_pipelines: config.include_mr_pipelines,
             auto_fetch_days,
+            os_notifications: config.os_notifications,
+            ignore_bot_comments: config.ignore_bot_comments,
+            include_projects: config.include_projects.clone(),
+            exclude_projects: config.exclude_projects.clone(),
+            hydrated_pipelines: HashSet::new(),
+            hydrated_mrs: HashSet::new(),
+            last_seen_event_id: HashMap::new(),
+            recent_activity: Vec::new(),
         }
+    }
+
+    pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
+        &self.recent_activity
+    }
+
+    fn emit_notification(&self, summary: &str, body: &str, urgency: NotifyUrgency) {
+        let banner_msg: CompactString = format!("{summary}: {body}").into();
+        self.sender.dispatch(GlimEvent::ActivityNotice(banner_msg));
+        if self.os_notifications {
+            send_os_notification(summary, body, urgency);
+        }
+    }
+
+    fn should_watch_project(&self, project: &Project) -> bool {
+        if is_older_than_days(project.last_activity(), self.auto_fetch_days) {
+            return false;
+        }
+        let path_lower = project.path.to_lowercase();
+
+        if let Some(excludes) = &self.exclude_projects {
+            if excludes
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .any(|term| path_lower.contains(&term))
+            {
+                return false;
+            }
+        }
+
+        if let Some(includes) = &self.include_projects {
+            let terms: Vec<String> = includes
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !terms.is_empty() && !terms.iter().any(|term| path_lower.contains(term)) {
+                return false;
+            }
+        }
+
+        true
     }
 
     #[instrument(skip(self, event), fields(event_type = %event.variant_name()))]
@@ -44,17 +112,24 @@ impl ProjectStore {
                 self.max_recent_pipelines = config.max_recent_pipelines;
                 self.include_mr_pipelines = config.include_mr_pipelines;
                 self.auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
+                self.os_notifications = config.os_notifications;
+                self.ignore_bot_comments = config.ignore_bot_comments;
+                self.include_projects = config.include_projects.clone();
+                self.exclude_projects = config.exclude_projects.clone();
             },
 
-            // requests jobs for pipelines that have not been loaded yet
+            // requests jobs for pipelines that have not been loaded yet, plus fresh MRs & events
             GlimEvent::ProjectDetailsOpen(id) => {
                 debug!(project_id = %id, "Opening project details and requesting missing jobs");
                 let project = self.find(*id).unwrap();
+                let project_id = project.id;
                 project
                     .recent_pipelines(self.max_recent_pipelines, self.include_mr_pipelines)
                     .into_iter()
                     .filter(|p| p.jobs.is_none())
-                    .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project.id, p.id)));
+                    .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project_id, p.id)));
+                self.dispatch(GlimEvent::MergeRequestsFetch(project_id));
+                self.dispatch(GlimEvent::ProjectEventsFetch(project_id));
             },
 
             // updates the projects in the store
@@ -91,22 +166,193 @@ impl ProjectStore {
                 debug!(project_id = %project_id, pipeline_count = pipelines.len(), "Processing received pipelines");
                 let sender = self.sender.clone();
 
+                let is_hydrated = self.hydrated_pipelines.contains(&project_id);
+                let mut notifications: Vec<(String, String, NotifyUrgency)> = Vec::new();
+
                 if let Some(project) = self.find_mut(project_id) {
-                    let pipelines: Vec<Pipeline> = pipelines
+                    let project_title = project.title();
+                    let new_pipelines: Vec<Pipeline> = pipelines
                         .iter()
                         .map(|p| Pipeline::from(p.clone()))
                         .collect();
 
-                    pipelines
+                    if is_hydrated {
+                        if let Some(old_pipelines) = &project.pipelines {
+                            for p in &new_pipelines {
+                                if let Some(old_p) = old_pipelines.iter().find(|op| op.id == p.id) {
+                                    if old_p.status != p.status {
+                                        let mr_tag = project
+                                            .merge_request_for_branch(&p.branch)
+                                            .map(|mr| format!(" (!{})", mr.iid))
+                                            .unwrap_or_default();
+                                        match p.status {
+                                            PipelineStatus::Failed => {
+                                                notifications.push((
+                                                    format!("🔴 [{}] Pipeline failed", project_title),
+                                                    format!("{}{}", p.branch, mr_tag),
+                                                    NotifyUrgency::Critical,
+                                                ));
+                                            },
+                                            PipelineStatus::Success if old_p.status.is_active() => {
+                                                notifications.push((
+                                                    format!("🟢 [{}] Pipeline passed", project_title),
+                                                    format!("{}{}", p.branch, mr_tag),
+                                                    NotifyUrgency::Normal,
+                                                ));
+                                            },
+                                            _ => {},
+                                        }
+                                    }
+                                } else if p.status == PipelineStatus::Failed {
+                                    let mr_tag = project
+                                        .merge_request_for_branch(&p.branch)
+                                        .map(|mr| format!(" (!{})", mr.iid))
+                                        .unwrap_or_default();
+                                    notifications.push((
+                                        format!("🔴 [{}] Pipeline failed", project_title),
+                                        format!("{}{}", p.branch, mr_tag),
+                                        NotifyUrgency::Critical,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    new_pipelines
                         .iter()
                         .filter(|&p| p.status.is_active() || p.has_active_jobs())
                         .for_each(|p| sender.dispatch(GlimEvent::JobsFetch(project_id, p.id)));
 
-                    project.update_pipelines(pipelines);
+                    project.update_pipelines(new_pipelines);
                     sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())))
                 }
 
+                self.hydrated_pipelines.insert(project_id);
+                for (summary, body, urgency) in notifications {
+                    self.emit_notification(&summary, &body, urgency);
+                }
+
                 self.sorted = self.projects_sorted_by_last_activity();
+            },
+
+            // updates open merge requests for a project
+            GlimEvent::MergeRequestsLoaded(project_id, mr_dtos) => {
+                debug!(
+                    project_id = %project_id,
+                    mr_count = mr_dtos.len(),
+                    "Processing received merge requests"
+                );
+                let sender = self.sender.clone();
+                let is_hydrated = self.hydrated_mrs.contains(project_id);
+                let mut notifications: Vec<(String, String, NotifyUrgency)> = Vec::new();
+
+                if let Some(project) = self.find_mut(*project_id) {
+                    let project_title = project.title();
+                    let new_mrs: Vec<MergeRequest> = mr_dtos
+                        .iter()
+                        .cloned()
+                        .map(MergeRequest::from)
+                        .collect();
+
+                    if is_hydrated {
+                        for mr in &new_mrs {
+                            if let Some(old_mr) =
+                                project.merge_requests.iter().find(|omr| omr.iid == mr.iid)
+                            {
+                                if !old_mr.is_conflicted() && mr.is_conflicted() {
+                                    notifications.push((
+                                        format!("⚡ [{}] !{} has merge conflicts", project_title, mr.iid),
+                                        format!("{} ({})", mr.title, mr.source_branch),
+                                        NotifyUrgency::Critical,
+                                    ));
+                                }
+                                if mr.upvotes > old_mr.upvotes {
+                                    notifications.push((
+                                        format!("👍 [{}] !{} approved", project_title, mr.iid),
+                                        format!("{} (👍{})", mr.title, mr.upvotes),
+                                        NotifyUrgency::Normal,
+                                    ));
+                                }
+                                if old_mr.blocking_discussions_resolved
+                                    && !mr.blocking_discussions_resolved
+                                {
+                                    notifications.push((
+                                        format!("🔒 [{}] !{} has unresolved threads", project_title, mr.iid),
+                                        mr.title.to_string(),
+                                        NotifyUrgency::Normal,
+                                    ));
+                                } else if !old_mr.blocking_discussions_resolved
+                                    && mr.blocking_discussions_resolved
+                                {
+                                    notifications.push((
+                                        format!("✅ [{}] !{} threads resolved", project_title, mr.iid),
+                                        mr.title.to_string(),
+                                        NotifyUrgency::Normal,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    project.update_merge_requests(new_mrs);
+                    sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())));
+                }
+
+                self.hydrated_mrs.insert(*project_id);
+                for (summary, body, urgency) in notifications {
+                    self.emit_notification(&summary, &body, urgency);
+                }
+
+                self.sorted = self.projects_sorted_by_last_activity();
+            },
+
+            // updates recent project events (MR opens/merges/comments/pushes)
+            GlimEvent::ProjectEventsLoaded(project_id, event_dtos) => {
+                debug!(
+                    project_id = %project_id,
+                    event_count = event_dtos.len(),
+                    "Processing received project events"
+                );
+                let prev_max_id = self.last_seen_event_id.get(project_id).copied();
+                let max_id = event_dtos
+                    .iter()
+                    .map(|e| e.id)
+                    .max()
+                    .unwrap_or(prev_max_id.unwrap_or(0));
+                self.last_seen_event_id.insert(*project_id, max_id);
+
+                let Some(project) = self.find(*project_id).cloned() else {
+                    return;
+                };
+
+                let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+
+                for dto in event_dtos {
+                    if self.ignore_bot_comments && dto.is_bot_event() {
+                        continue;
+                    }
+                    if let Some(activity) = convert_gitlab_event(dto, &project) {
+                        if let Some(prev_max) = prev_max_id {
+                            if activity.id > prev_max {
+                                newly_arrived.push(activity.clone());
+                            }
+                        }
+                        if !self.recent_activity.iter().any(|existing| existing.id == activity.id) {
+                            self.recent_activity.push(activity);
+                        }
+                    }
+                }
+
+                self.recent_activity
+                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+
+                // Emit notifications for newly arrived events in chronological order
+                newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                for ev in newly_arrived {
+                    let (summary, body, urgency) = format_activity_notification(&ev);
+                    self.emit_notification(&summary, &body, urgency);
+                }
             },
 
             GlimEvent::JobsLoaded(project_id, pipeline_id, job_dtos) => {
@@ -176,16 +422,18 @@ impl ProjectStore {
     #[instrument(skip(self, project), fields(project_id = %project.id, project_path = %project.path))]
     fn sync_project(&mut self, mut project: Project) {
         let sender = self.sender.clone();
-        let auto_fetch_days = self.auto_fetch_days;
+        let watch = self.should_watch_project(&project);
         match self.find_mut(project.id) {
             Some(existing_entry) => {
-                sender.dispatch(GlimEvent::PipelinesFetch(project.id));
-                existing_entry.update_project(project.clone())
+                existing_entry.update_project(project.clone());
+                if watch {
+                    sender.dispatch(GlimEvent::PipelinesFetch(project.id));
+                }
             },
             None => {
                 self.project_id_lookup
                     .insert(project.id, self.projects.len());
-                if !is_older_than_days(project.last_activity(), auto_fetch_days) {
+                if watch {
                     sender.dispatch(GlimEvent::PipelinesFetch(project.id));
                     project.pipelines = Some(Vec::new());
                 }
@@ -193,6 +441,156 @@ impl ProjectStore {
             },
         }
     }
+}
+
+pub fn convert_gitlab_event(
+    dto: &GitlabEventDto,
+    project: &Project,
+) -> Option<ProjectActivityEvent> {
+    let project_name = project.title();
+    let author = dto.author_username.clone();
+    let action = dto.action_name.as_str();
+    let target_type = dto.target_type.as_deref().unwrap_or("");
+
+    match (action, target_type) {
+        ("opened", "MergeRequest") => {
+            let mr_iid = dto.target_iid;
+            let title = dto.target_title.clone().unwrap_or_default();
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::MrOpened,
+                author,
+                mr_iid,
+                branch: None,
+                summary: title,
+                detail: None,
+                created_at: dto.created_at,
+            })
+        },
+        ("accepted" | "merged", "MergeRequest") => {
+            let mr_iid = dto.target_iid;
+            let title = dto.target_title.clone().unwrap_or_default();
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::MrMerged,
+                author,
+                mr_iid,
+                branch: None,
+                summary: title,
+                detail: None,
+                created_at: dto.created_at,
+            })
+        },
+        ("closed", "MergeRequest") => {
+            let mr_iid = dto.target_iid;
+            let title = dto.target_title.clone().unwrap_or_default();
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::MrClosed,
+                author,
+                mr_iid,
+                branch: None,
+                summary: title,
+                detail: None,
+                created_at: dto.created_at,
+            })
+        },
+        ("approved", "MergeRequest") => {
+            let mr_iid = dto.target_iid;
+            let title = dto.target_title.clone().unwrap_or_default();
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::MrApproved,
+                author,
+                mr_iid,
+                branch: None,
+                summary: title,
+                detail: None,
+                created_at: dto.created_at,
+            })
+        },
+        (a, _) if a.starts_with("commented") => {
+            let note = dto.note.as_ref()?;
+            if note.noteable_type.as_deref() != Some("MergeRequest") {
+                return None;
+            }
+            let mr_iid = note.noteable_iid.or(dto.target_iid);
+            let snippet = clean_note_body(&note.body, 90);
+            if snippet.is_empty() {
+                return None;
+            }
+            let mr_title = dto.target_title.clone();
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::MrComment,
+                author,
+                mr_iid,
+                branch: None,
+                summary: snippet,
+                detail: mr_title,
+                created_at: dto.created_at,
+            })
+        },
+        (a, _) if a.starts_with("pushed") => {
+            let push = dto.push_data.as_ref()?;
+            let branch = push.branch.clone()?;
+            let mr_iid = project
+                .merge_request_for_branch(&branch)
+                .map(|mr| mr.iid);
+            let commit_title = push
+                .commit_title
+                .clone()
+                .unwrap_or_else(|| format!("{} commit(s)", push.commit_count).into());
+            Some(ProjectActivityEvent {
+                id: dto.id,
+                project_id: project.id,
+                project_name,
+                kind: ActivityKind::BranchPush,
+                author,
+                mr_iid,
+                branch: Some(branch),
+                summary: commit_title,
+                detail: if push.commit_count > 1 {
+                    Some(format!("{} commits", push.commit_count).into())
+                } else {
+                    None
+                },
+                created_at: dto.created_at,
+            })
+        },
+        _ => None,
+    }
+}
+
+fn format_activity_notification(
+    ev: &ProjectActivityEvent,
+) -> (String, String, NotifyUrgency) {
+    let mr_ref = ev
+        .mr_iid
+        .map(|iid| format!("!{iid}"))
+        .or_else(|| ev.branch.as_ref().map(|b| b.to_string()))
+        .unwrap_or_default();
+
+    let summary = format!(
+        "{} [{}] @{} {} {}",
+        ev.kind.icon(),
+        ev.project_name,
+        ev.author,
+        ev.kind.action_label(),
+        mr_ref
+    );
+    let body = ev.summary.to_string();
+    (summary, body, NotifyUrgency::Normal)
 }
 
 fn is_older_than_days(date: DateTime<Utc>, days: i64) -> bool {
@@ -210,6 +608,18 @@ pub fn log_event(event: &GlimEvent) {
         GlimEvent::JobsActiveFetch => debug!("Requesting active pipelines for all projects"),
         GlimEvent::PipelinesFetch(id) => {
             debug!(project_id = %id, "Requesting pipelines for project")
+        },
+        GlimEvent::MergeRequestsFetch(id) => {
+            debug!(project_id = %id, "Requesting merge requests for project")
+        },
+        GlimEvent::MergeRequestsLoaded(project_id, mrs) => {
+            debug!(project_id = %project_id, count = mrs.len(), "Received merge requests from GitLab API")
+        },
+        GlimEvent::ProjectEventsFetch(id) => {
+            debug!(project_id = %id, "Requesting recent events for project")
+        },
+        GlimEvent::ProjectEventsLoaded(project_id, events) => {
+            debug!(project_id = %project_id, count = events.len(), "Received project events from GitLab API")
         },
         GlimEvent::JobsFetch(project_id, pipeline_id) => {
             debug!(project_id = %project_id, pipeline_id = %pipeline_id, "Requesting jobs")
@@ -231,6 +641,9 @@ pub fn log_event(event: &GlimEvent) {
         GlimEvent::ProjectOpenUrl(id) => info!(project_id = %id, "Opening project in browser"),
         GlimEvent::PipelineOpenUrl(project_id, pipeline_id) => {
             info!(project_id = %project_id, pipeline_id = %pipeline_id, "Opening pipeline in browser")
+        },
+        GlimEvent::MergeRequestOpenUrl(project_id, mr_iid) => {
+            info!(project_id = %project_id, mr_iid = %mr_iid, "Opening merge request in browser")
         },
         GlimEvent::JobOpenUrl(project_id, pipeline_id, job_id) => {
             info!(project_id = %project_id, pipeline_id = %pipeline_id, job_id = %job_id, "Opening job in browser")
@@ -266,5 +679,105 @@ pub fn log_event(event: &GlimEvent) {
 impl Dispatcher for ProjectStore {
     fn dispatch(&self, event: GlimEvent) {
         self.sender.send(event).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{GitlabEventNoteDto, MergeRequestDto, ProjectDto, StatisticsDto};
+
+    fn sample_project() -> Project {
+        Project::from(ProjectDto {
+            id: ProjectId::new(24),
+            path_with_namespace: "caasa/connect".into(),
+            description: None,
+            default_branch: "master".into(),
+            ssh_url_to_repo: "git@gitlab.nvestiv.com:caasa/connect.git".into(),
+            web_url: "https://gitlab.nvestiv.com/caasa/connect".into(),
+            last_activity_at: Utc::now(),
+            statistics: StatisticsDto::default(),
+        })
+    }
+
+    #[test]
+    fn test_bot_event_filtering() {
+        let bot_event = GitlabEventDto {
+            id: 2887,
+            project_id: ProjectId::new(24),
+            action_name: "commented on".into(),
+            target_type: Some("Note".into()),
+            target_iid: Some(3005),
+            target_title: Some("Emails 6".into()),
+            author_username: "project_24_bot_d365985ed3c305853d6f00fa0f7a979b".into(),
+            created_at: Utc::now(),
+            note: Some(GitlabEventNoteDto {
+                id: 3005,
+                body: "<!-- linear-linkback -->\n<details>CAA-322</details>".into(),
+                noteable_type: Some("MergeRequest".into()),
+                noteable_iid: Some(61),
+                system: false,
+            }),
+            push_data: None,
+        };
+        assert!(bot_event.is_bot_event());
+
+        let human_comment = GitlabEventDto {
+            id: 2890,
+            project_id: ProjectId::new(24),
+            action_name: "commented on".into(),
+            target_type: Some("DiscussionNote".into()),
+            target_iid: Some(3010),
+            target_title: Some("Emails 6".into()),
+            author_username: "saad".into(),
+            created_at: Utc::now(),
+            note: Some(GitlabEventNoteDto {
+                id: 3010,
+                body: "<p>Looks great, let's merge after CI passes!</p>".into(),
+                noteable_type: Some("MergeRequest".into()),
+                noteable_iid: Some(61),
+                system: false,
+            }),
+            push_data: None,
+        };
+        assert!(!human_comment.is_bot_event());
+
+        let project = sample_project();
+        let activity = convert_gitlab_event(&human_comment, &project).unwrap();
+        assert_eq!(activity.kind, ActivityKind::MrComment);
+        assert_eq!(activity.mr_iid, Some(61));
+        assert_eq!(activity.author, "saad");
+        assert_eq!(activity.summary, "Looks great, let's merge after CI passes!");
+    }
+
+    #[test]
+    fn test_merge_request_status_helpers() {
+        let dto: MergeRequestDto = serde_json::from_value(serde_json::json!({
+            "id": 255,
+            "iid": 61,
+            "project_id": 24,
+            "title": "Emails 6",
+            "state": "opened",
+            "source_branch": "track/CAA-322-email-template-dsl",
+            "target_branch": "track/CAA-322-atdd-email-specs",
+            "draft": false,
+            "detailed_merge_status": "mergeable",
+            "has_conflicts": false,
+            "blocking_discussions_resolved": true,
+            "user_notes_count": 2,
+            "upvotes": 1,
+            "author": { "username": "paul" },
+            "updated_at": "2026-10-23T06:17:21.689Z",
+            "web_url": "https://gitlab.nvestiv.com/caasa/connect/-/merge_requests/61"
+        }))
+        .unwrap();
+
+        let mr = MergeRequest::from(dto);
+        assert!(mr.is_mergeable());
+        assert!(!mr.is_conflicted());
+        assert!(!mr.has_unresolved_threads());
+        assert_eq!(mr.iid, 61);
+        assert_eq!(mr.upvotes, 1);
+        assert_eq!(mr.user_notes_count, 2);
     }
 }

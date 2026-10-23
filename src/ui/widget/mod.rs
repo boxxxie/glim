@@ -1,3 +1,4 @@
+mod activity_feed;
 mod input_field;
 mod notification;
 mod pipeline_table;
@@ -5,6 +6,7 @@ mod projects_table;
 mod shortcuts;
 
 use chrono::{DateTime, Local};
+pub use activity_feed::*;
 pub use input_field::*;
 pub use notification::*;
 pub use pipeline_table::*;

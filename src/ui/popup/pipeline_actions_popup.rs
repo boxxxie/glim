@@ -39,11 +39,14 @@ impl PipelineActionsPopupState {
         self.actions
             .iter()
             .map(|action| {
-                let action = match action {
-                    GlimEvent::JobOpenUrl(_, _, _) => "browse to failed job",
-                    GlimEvent::PipelineOpenUrl(_, _) => "browse to pipeline",
-                    GlimEvent::ProjectOpenUrl(_) => "browse to project",
-                    GlimEvent::JobLogFetch(_, _) => "download failed job log to clipboard",
+                let action: String = match action {
+                    GlimEvent::MergeRequestOpenUrl(_, mr_iid) => {
+                        format!("browse to merge request (!{mr_iid})")
+                    },
+                    GlimEvent::JobOpenUrl(_, _, _) => "browse to failed job".into(),
+                    GlimEvent::PipelineOpenUrl(_, _) => "browse to pipeline".into(),
+                    GlimEvent::ProjectOpenUrl(_) => "browse to project".into(),
+                    GlimEvent::JobLogFetch(_, _) => "download failed job log to clipboard".into(),
                     _ => panic!("unsupported action"),
                 };
                 Line::from(action).style(theme().pipeline_action)

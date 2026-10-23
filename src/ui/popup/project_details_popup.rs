@@ -70,7 +70,7 @@ impl ProjectDetailsPopupState {
 
         let pipelines: Vec<&Pipeline> =
             project.recent_pipelines(max_recent_pipelines, include_mr_pipelines);
-        let pipelines = PipelineTable::new(&pipelines);
+        let pipelines = PipelineTable::new(&pipelines, &project.merge_requests);
 
         ProjectDetailsPopupState {
             project,
@@ -159,6 +159,7 @@ impl StatefulWidget for ProjectDetailsPopup {
             &state
                 .project
                 .recent_pipelines(state.max_recent_pipelines, state.include_mr_pipelines),
+            &state.project.merge_requests,
         )
         .render(outer_layout[1], buf, &mut state.pipelines_table_state);
     }

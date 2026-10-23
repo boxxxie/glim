@@ -264,6 +264,88 @@ impl GitlabService {
             }
         });
     }
+
+    /// Fetch open merge requests for a project and dispatch results
+    #[instrument(skip(self), fields(project_id = %project_id))]
+    pub async fn fetch_merge_requests(&self, project_id: ProjectId) -> Result<()> {
+        if !self.api.is_configured() {
+            return Ok(());
+        }
+
+        match self.api.get_merge_requests(project_id).await {
+            Ok(mrs) => {
+                debug!(
+                    mr_count = mrs.len(),
+                    project_id = %project_id,
+                    "Successfully fetched merge requests"
+                );
+                self.sender
+                    .dispatch(GlimEvent::MergeRequestsLoaded(project_id, mrs));
+                Ok(())
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_id = %project_id,
+                    "Failed to fetch merge requests"
+                );
+                Err(e)
+            },
+        }
+    }
+
+    /// Spawn an async task to fetch open merge requests
+    pub fn spawn_fetch_merge_requests(&self, project_id: ProjectId) {
+        let api = self.api.clone();
+        let sender = self.sender.clone();
+        self.handle.spawn(async move {
+            let temp_service = Self::from_api(api, sender).unwrap();
+            if let Err(e) = temp_service.fetch_merge_requests(project_id).await {
+                warn!("Background merge requests fetch failed: {}", e);
+            }
+        });
+    }
+
+    /// Fetch recent project events and dispatch results
+    #[instrument(skip(self), fields(project_id = %project_id))]
+    pub async fn fetch_project_events(&self, project_id: ProjectId) -> Result<()> {
+        if !self.api.is_configured() {
+            return Ok(());
+        }
+
+        match self.api.get_project_events(project_id).await {
+            Ok(events) => {
+                debug!(
+                    event_count = events.len(),
+                    project_id = %project_id,
+                    "Successfully fetched project events"
+                );
+                self.sender
+                    .dispatch(GlimEvent::ProjectEventsLoaded(project_id, events));
+                Ok(())
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_id = %project_id,
+                    "Failed to fetch project events"
+                );
+                Err(e)
+            },
+        }
+    }
+
+    /// Spawn an async task to fetch project events
+    pub fn spawn_fetch_project_events(&self, project_id: ProjectId) {
+        let api = self.api.clone();
+        let sender = self.sender.clone();
+        self.handle.spawn(async move {
+            let temp_service = Self::from_api(api, sender).unwrap();
+            if let Err(e) = temp_service.fetch_project_events(project_id).await {
+                warn!("Background project events fetch failed: {}", e);
+            }
+        });
+    }
 }
 
 // Convert ClientError to the application's GlimError type

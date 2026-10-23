@@ -230,6 +230,11 @@ impl ConfigPopupState {
             include_mr_pipelines: self.base_config.include_mr_pipelines,
             include_projects: self.base_config.include_projects.clone(),
             exclude_projects: self.base_config.exclude_projects.clone(),
+            os_notifications: self.base_config.os_notifications,
+            ignore_bot_comments: self.base_config.ignore_bot_comments,
+            projects_poll_seconds: self.base_config.projects_poll_seconds,
+            jobs_poll_seconds: self.base_config.jobs_poll_seconds,
+            activity_feed_lines: self.base_config.activity_feed_lines,
         }
     }
 

@@ -6,7 +6,7 @@ use tracing::Level;
 
 use crate::{
     dispatcher::Dispatcher,
-    domain::{JobDto, PipelineDto, Project, ProjectDto},
+    domain::{GitlabEventDto, JobDto, MergeRequestDto, PipelineDto, Project, ProjectDto},
     glim_app::GlimConfig,
     id::{JobId, PipelineId, ProjectId},
     result,
@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum GlimEvent {
+    ActivityNotice(CompactString),
     AppError(result::GlimError),
     AppExit,
     AppTick,
@@ -38,6 +39,9 @@ pub enum GlimEvent {
     JobsLoaded(ProjectId, PipelineId, Vec<JobDto>),
     LogEntry(CompactString),
     LogLevelChanged(Level),
+    MergeRequestOpenUrl(ProjectId, u64),
+    MergeRequestsFetch(ProjectId),
+    MergeRequestsLoaded(ProjectId, Vec<MergeRequestDto>),
     NotificationDismiss,
     NotificationLast,
     PipelineActionsClose,
@@ -48,6 +52,8 @@ pub enum GlimEvent {
     PipelinesLoaded(Vec<PipelineDto>),
     ProjectDetailsClose,
     ProjectDetailsOpen(ProjectId),
+    ProjectEventsFetch(ProjectId),
+    ProjectEventsLoaded(ProjectId, Vec<GitlabEventDto>),
     #[allow(dead_code)]
     ProjectFetch(ProjectId),
     ProjectNext,
@@ -59,12 +65,14 @@ pub enum GlimEvent {
     ProjectsLoaded(Vec<ProjectDto>),
     ScreenCapture,
     ScreenCaptureToClipboard(String),
+    ToggleActivityFeed,
 }
 
 impl GlimEvent {
     /// Get the variant name as a string slice (without "GlimEvent::" prefix)
     pub fn variant_name(&self) -> &'static str {
         match self {
+            GlimEvent::ActivityNotice(_) => "ActivityNotice",
             GlimEvent::AppError(_) => "AppError",
             GlimEvent::AppExit => "AppExit",
             GlimEvent::AppTick => "AppTick",
@@ -88,6 +96,9 @@ impl GlimEvent {
             GlimEvent::JobsLoaded(_, _, _) => "JobsLoaded",
             GlimEvent::LogEntry(_) => "LogEntry",
             GlimEvent::LogLevelChanged(_) => "LogLevelChanged",
+            GlimEvent::MergeRequestOpenUrl(_, _) => "MergeRequestOpenUrl",
+            GlimEvent::MergeRequestsFetch(_) => "MergeRequestsFetch",
+            GlimEvent::MergeRequestsLoaded(_, _) => "MergeRequestsLoaded",
             GlimEvent::NotificationDismiss => "NotificationDismiss",
             GlimEvent::NotificationLast => "NotificationLast",
             GlimEvent::PipelineActionsClose => "PipelineActionsClose",
@@ -98,6 +109,8 @@ impl GlimEvent {
             GlimEvent::PipelinesLoaded(_) => "PipelinesLoaded",
             GlimEvent::ProjectDetailsClose => "ProjectDetailsClose",
             GlimEvent::ProjectDetailsOpen(_) => "ProjectDetailsOpen",
+            GlimEvent::ProjectEventsFetch(_) => "ProjectEventsFetch",
+            GlimEvent::ProjectEventsLoaded(_, _) => "ProjectEventsLoaded",
             GlimEvent::ProjectFetch(_) => "ProjectFetch",
             GlimEvent::ProjectNext => "ProjectNext",
             GlimEvent::ProjectOpenUrl(_) => "ProjectOpenUrl",
@@ -108,6 +121,7 @@ impl GlimEvent {
             GlimEvent::ProjectsLoaded(_) => "ProjectsLoaded",
             GlimEvent::ScreenCapture => "ScreenCapture",
             GlimEvent::ScreenCaptureToClipboard(_) => "ScreenCaptureToClipboard",
+            GlimEvent::ToggleActivityFeed => "ToggleActivityFeed",
         }
     }
 }

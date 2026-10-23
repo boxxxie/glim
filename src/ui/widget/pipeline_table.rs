@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    domain::{IconRepresentable, Pipeline},
+    domain::{IconRepresentable, MergeRequest, Pipeline},
     theme::theme,
     ui::{format_duration, widget::text_from},
 };
@@ -28,7 +28,7 @@ pub struct PipelineTable {
 }
 
 impl PipelineTable {
-    pub fn new(pipelines: &[&Pipeline]) -> Self {
+    pub fn new(pipelines: &[&Pipeline], merge_requests: &[MergeRequest]) -> Self {
         let (max_branch, max_job_name, max_failed_job_name, max_duration) =
             pipelines
                 .iter()
@@ -57,27 +57,53 @@ impl PipelineTable {
             ],
             rows: pipelines
                 .iter()
-                .map(|p| Self::parse_row(p))
+                .map(|p| {
+                    let mr = merge_requests
+                        .iter()
+                        .find(|mr| mr.source_branch == p.branch);
+                    Self::parse_row(p, mr)
+                })
                 .enumerate()
                 .map(|(idx, r)| r.style(theme().table_row(idx)))
                 .collect(),
         }
     }
 
-    fn parse_row(p: &Pipeline) -> Row<'static> {
+    fn parse_row(p: &Pipeline, mr: Option<&MergeRequest>) -> Row<'static> {
         let branch = p.branch.clone();
 
         let comment = if let Some(commit) = &p.commit {
             commit.title.clone()
+        } else if let Some(mr) = mr {
+            mr.title.clone()
         } else {
             "".to_compact_string()
         };
 
         let branch_text = branch.to_string();
-        let source_text = p.source.to_string().to_string();
+        let second_line = if let Some(mr) = mr {
+            let mut spans = vec![
+                Span::from(format!("!{}", mr.iid)).style(theme().mr_iid),
+                Span::from(format!(" ({})", p.source.to_string())).style(theme().pipeline_source),
+            ];
+            if mr.is_conflicted() {
+                spans.push(Span::from(" ⚡conflict").style(theme().mr_conflict));
+            } else if mr.is_mergeable() {
+                spans.push(Span::from(" ✓").style(theme().mr_mergeable));
+            }
+            if mr.user_notes_count > 0 {
+                spans.push(
+                    Span::from(format!(" 💬{}", mr.user_notes_count)).style(theme().mr_comments),
+                );
+            }
+            Line::from(spans)
+        } else {
+            Line::from(p.source.to_string().to_string()).style(theme().pipeline_source)
+        };
+
         let branch_cell = Cell::from(Text::from(vec![
             Line::from(branch_text).style(theme().pipeline_branch),
-            Line::from(source_text).style(theme().pipeline_source),
+            second_line,
         ]));
 
         Row::new(vec![

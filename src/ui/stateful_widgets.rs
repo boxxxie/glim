@@ -29,6 +29,7 @@ pub struct StatefulWidgets {
     pub filter_input_text: CompactString,
     pub temporary_filter: Option<CompactString>,
     pub capture_screen_requested: bool,
+    pub show_activity_feed: bool,
     current_filtered_indices: Vec<usize>,
 }
 
@@ -46,6 +47,7 @@ impl StatefulWidgets {
             filter_input_text: CompactString::default(),
             temporary_filter: None,
             capture_screen_requested: false,
+            show_activity_feed: true,
             current_filtered_indices: Vec::new(),
         }
     }
@@ -93,6 +95,7 @@ impl StatefulWidgets {
             GlimEvent::FilterInputBackspace => self.remove_filter_char(),
             GlimEvent::FilterClear => self.clear_filter(),
             GlimEvent::ApplyTemporaryFilter(filter) => self.apply_temporary_filter(filter.clone()),
+            GlimEvent::ToggleActivityFeed => self.show_activity_feed = !self.show_activity_feed,
 
             _ => (),
         }
@@ -154,23 +157,25 @@ impl StatefulWidgets {
         pipeline_id: PipelineId,
         popup_area: RefRect,
     ) {
-        let failed_job = project
-            .pipeline(pipeline_id)
-            .and_then(|p| p.failed_job());
+        let pipeline = project.pipeline(pipeline_id);
+        let failed_job = pipeline.and_then(|p| p.failed_job());
+        let mr_iid = pipeline
+            .and_then(|p| project.merge_request_for_branch(&p.branch))
+            .map(|mr| mr.iid);
 
-        let actions = if let Some(job) = failed_job {
-            vec![
-                GlimEvent::JobOpenUrl(project.id, pipeline_id, job.id),
-                GlimEvent::PipelineOpenUrl(project.id, pipeline_id),
-                GlimEvent::ProjectOpenUrl(project.id),
-                GlimEvent::JobLogFetch(project.id, pipeline_id),
-            ]
+        let mut actions = Vec::new();
+        if let Some(iid) = mr_iid {
+            actions.push(GlimEvent::MergeRequestOpenUrl(project.id, iid));
+        }
+        if let Some(job) = failed_job {
+            actions.push(GlimEvent::JobOpenUrl(project.id, pipeline_id, job.id));
+            actions.push(GlimEvent::PipelineOpenUrl(project.id, pipeline_id));
+            actions.push(GlimEvent::ProjectOpenUrl(project.id));
+            actions.push(GlimEvent::JobLogFetch(project.id, pipeline_id));
         } else {
-            vec![
-                GlimEvent::PipelineOpenUrl(project.id, pipeline_id),
-                GlimEvent::ProjectOpenUrl(project.id),
-            ]
-        };
+            actions.push(GlimEvent::PipelineOpenUrl(project.id, pipeline_id));
+            actions.push(GlimEvent::ProjectOpenUrl(project.id));
+        }
 
         self.pipeline_actions = Some(PipelineActionsPopupState::new(actions, popup_area));
     }

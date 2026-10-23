@@ -23,6 +23,7 @@ mod id;
 mod input;
 mod logging;
 mod notice_service;
+mod os_notify;
 mod rendering;
 mod result;
 mod stores;

@@ -32,6 +32,14 @@ pub struct Theme {
     pub input_description_em: Style,
     pub input_label: Style,
     pub configuration_error: Style,
+    pub mr_iid: Style,
+    pub mr_mergeable: Style,
+    pub mr_conflict: Style,
+    pub mr_draft: Style,
+    pub mr_comments: Style,
+    pub mr_target: Style,
+    pub activity_author: Style,
+    pub activity_action: Style,
     pub border: ThemeBorder,
 }
 
@@ -116,6 +124,24 @@ impl Theme {
             configuration_error: Style::default()
                 .fg(Gruvbox::YellowBright.into())
                 .add_modifier(Modifier::BOLD),
+            mr_iid: Style::default()
+                .fg(Gruvbox::PurpleBright.into())
+                .add_modifier(Modifier::BOLD),
+            mr_mergeable: Style::default()
+                .fg(Gruvbox::GreenBright.into())
+                .add_modifier(Modifier::BOLD),
+            mr_conflict: Style::default()
+                .fg(Gruvbox::RedBright.into())
+                .add_modifier(Modifier::BOLD),
+            mr_draft: Style::default().fg(Gruvbox::YellowBright.into()),
+            mr_comments: Style::default().fg(Gruvbox::AquaBright.into()),
+            mr_target: Style::default()
+                .fg(Gruvbox::Gray244.into())
+                .add_modifier(Modifier::ITALIC),
+            activity_author: Style::default()
+                .fg(Gruvbox::YellowBright.into())
+                .add_modifier(Modifier::BOLD),
+            activity_action: Style::default().fg(Gruvbox::AquaBright.into()),
             border: ThemeBorder {
                 title: Style::default()
                     .bg(Gruvbox::Orange.into())

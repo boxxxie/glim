@@ -13,7 +13,7 @@ use super::{
     error::{ClientError, Result},
 };
 use crate::{
-    domain::{JobDto, PipelineDto, ProjectDto},
+    domain::{GitlabEventDto, JobDto, MergeRequestDto, PipelineDto, ProjectDto},
     id::{JobId, PipelineId, ProjectId},
 };
 
@@ -122,6 +122,40 @@ impl GitlabApi {
         let response = self.authenticated_request(&url).send().await?;
         let body = response.text().await?;
         Ok(body.into())
+    }
+
+    /// Get open merge requests for a project
+    #[instrument(skip(self), fields(project_id = %project_id))]
+    pub async fn get_merge_requests(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<MergeRequestDto>> {
+        let url = {
+            let config = self.config.read().unwrap();
+            format_compact!(
+                "{}/projects/{}/merge_requests?state=opened&per_page=30",
+                config.base_url,
+                project_id
+            )
+        };
+        self.get_json(&url).await
+    }
+
+    /// Get recent events (MR opens/merges/comments/pushes) for a project
+    #[instrument(skip(self), fields(project_id = %project_id))]
+    pub async fn get_project_events(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<GitlabEventDto>> {
+        let url = {
+            let config = self.config.read().unwrap();
+            format_compact!(
+                "{}/projects/{}/events?per_page=25",
+                config.base_url,
+                project_id
+            )
+        };
+        self.get_json(&url).await
     }
 
     /// Update configuration

@@ -24,9 +24,103 @@ pub struct Project {
     pub url: CompactString,
     pub last_activity_at: DateTime<Utc>,
     pub pipelines: Option<Vec<Pipeline>>,
+    pub merge_requests: Vec<MergeRequest>,
     pub commit_count: u32,
     pub repo_size_kb: u64,
     pub artifacts_size_kb: u64,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct MergeRequest {
+    pub id: u64,
+    pub iid: u64,
+    pub project_id: ProjectId,
+    pub title: CompactString,
+    pub state: CompactString,
+    pub source_branch: CompactString,
+    pub target_branch: CompactString,
+    pub draft: bool,
+    pub detailed_merge_status: CompactString,
+    pub has_conflicts: bool,
+    pub blocking_discussions_resolved: bool,
+    pub user_notes_count: u32,
+    pub upvotes: u32,
+    pub author_username: CompactString,
+    pub updated_at: DateTime<Utc>,
+    pub url: CompactString,
+}
+
+impl MergeRequest {
+    pub fn is_conflicted(&self) -> bool {
+        self.has_conflicts || self.detailed_merge_status == "conflict"
+    }
+
+    pub fn is_mergeable(&self) -> bool {
+        !self.is_conflicted()
+            && !self.draft
+            && self.blocking_discussions_resolved
+            && (self.detailed_merge_status == "mergeable"
+                || self.detailed_merge_status == "can_be_merged")
+    }
+
+    pub fn has_unresolved_threads(&self) -> bool {
+        !self.blocking_discussions_resolved
+            || self.detailed_merge_status == "discussions_not_resolved"
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ActivityKind {
+    MrOpened,
+    MrMerged,
+    MrClosed,
+    MrApproved,
+    MrComment,
+    BranchPush,
+    PipelineStatus,
+}
+
+impl ActivityKind {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            ActivityKind::MrOpened => "🟣",
+            ActivityKind::MrMerged => "🟢",
+            ActivityKind::MrClosed => "🚫",
+            ActivityKind::MrApproved => "👍",
+            ActivityKind::MrComment => "💬",
+            ActivityKind::BranchPush => "⬆️",
+            ActivityKind::PipelineStatus => "🔔",
+        }
+    }
+
+    pub fn action_label(&self) -> &'static str {
+        match self {
+            ActivityKind::MrOpened => "opened",
+            ActivityKind::MrMerged => "merged",
+            ActivityKind::MrClosed => "closed",
+            ActivityKind::MrApproved => "approved",
+            ActivityKind::MrComment => "commented",
+            ActivityKind::BranchPush => "pushed",
+            ActivityKind::PipelineStatus => "pipeline",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ProjectActivityEvent {
+    pub id: u64,
+    pub project_id: ProjectId,
+    pub project_name: CompactString,
+    pub kind: ActivityKind,
+    pub author: CompactString,
+    pub mr_iid: Option<u64>,
+    pub branch: Option<CompactString>,
+    pub summary: CompactString,
+    pub detail: Option<CompactString>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +207,126 @@ pub struct PipelineDto {
     pub web_url: CompactString,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+const fn default_true_bool() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeRequestAuthorDto {
+    #[serde(default)]
+    pub username: CompactString,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeRequestDto {
+    pub id: u64,
+    pub iid: u64,
+    pub project_id: ProjectId,
+    pub title: CompactString,
+    pub state: CompactString,
+    pub source_branch: CompactString,
+    pub target_branch: CompactString,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub detailed_merge_status: Option<CompactString>,
+    #[serde(default)]
+    pub merge_status: Option<CompactString>,
+    #[serde(default)]
+    pub has_conflicts: bool,
+    #[serde(default = "default_true_bool")]
+    pub blocking_discussions_resolved: bool,
+    #[serde(default)]
+    pub user_notes_count: u32,
+    #[serde(default)]
+    pub upvotes: u32,
+    #[serde(default)]
+    pub author: MergeRequestAuthorDto,
+    pub updated_at: DateTime<Utc>,
+    pub web_url: CompactString,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct GitlabEventNoteDto {
+    pub id: u64,
+    pub body: CompactString,
+    pub noteable_type: Option<CompactString>,
+    pub noteable_iid: Option<u64>,
+    #[serde(default)]
+    pub system: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct GitlabEventPushDataDto {
+    #[serde(default)]
+    pub commit_count: u32,
+    #[serde(default)]
+    pub action: CompactString,
+    #[serde(default)]
+    pub ref_type: CompactString,
+    #[serde(rename = "ref")]
+    pub branch: Option<CompactString>,
+    pub commit_title: Option<CompactString>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct GitlabEventDto {
+    pub id: u64,
+    pub project_id: ProjectId,
+    pub action_name: CompactString,
+    pub target_type: Option<CompactString>,
+    pub target_iid: Option<u64>,
+    pub target_title: Option<CompactString>,
+    #[serde(default)]
+    pub author_username: CompactString,
+    pub created_at: DateTime<Utc>,
+    pub note: Option<GitlabEventNoteDto>,
+    pub push_data: Option<GitlabEventPushDataDto>,
+}
+
+impl GitlabEventDto {
+    /// Returns true if this event was generated by an automated project bot or Linear linkback comment.
+    pub fn is_bot_event(&self) -> bool {
+        let user = self.author_username.as_str();
+        if user.starts_with("project_") && user.contains("_bot") {
+            return true;
+        }
+        if let Some(note) = &self.note {
+            if note.system || note.body.contains("<!-- linear-linkback -->") {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Strip HTML tags, comments, and collapse whitespace for clean 1-line comment previews.
+pub fn clean_note_body(raw: &str, max_chars: usize) -> CompactString {
+    let mut out = String::with_capacity(raw.len().min(max_chars + 16));
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            },
+            _ if !in_tag => out.push(ch),
+            _ => {},
+        }
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max_chars {
+        let truncated: String = collapsed.chars().take(max_chars).collect();
+        format!("{truncated}…").into()
+    } else {
+        collapsed.into()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Deserialize)]
@@ -260,6 +474,7 @@ impl Project {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_active_pipelines(&self) -> bool {
         self.pipelines.as_ref().is_some_and(|ps| {
             ps.iter()
@@ -279,6 +494,16 @@ impl Project {
             .as_ref()
             .and_then(|ps| ps.iter().find(|p| p.id == id))
     }
+
+    pub fn merge_request_for_branch(&self, branch: &str) -> Option<&MergeRequest> {
+        self.merge_requests
+            .iter()
+            .find(|mr| mr.source_branch == branch)
+    }
+
+    pub fn merge_request(&self, iid: u64) -> Option<&MergeRequest> {
+        self.merge_requests.iter().find(|mr| mr.iid == iid)
+    }
 }
 
 impl From<ProjectDto> for Project {
@@ -292,9 +517,37 @@ impl From<ProjectDto> for Project {
             url: p.web_url,
             last_activity_at: p.last_activity_at,
             pipelines: None,
+            merge_requests: Vec::new(),
             commit_count: p.statistics.commit_count,
             repo_size_kb: p.statistics.repository_size / 1024,
             artifacts_size_kb: p.statistics.job_artifacts_size / 1024,
+        }
+    }
+}
+
+impl From<MergeRequestDto> for MergeRequest {
+    fn from(dto: MergeRequestDto) -> Self {
+        let detailed_merge_status = dto
+            .detailed_merge_status
+            .or(dto.merge_status)
+            .unwrap_or_else(|| "unknown".into());
+        Self {
+            id: dto.id,
+            iid: dto.iid,
+            project_id: dto.project_id,
+            title: dto.title,
+            state: dto.state,
+            source_branch: dto.source_branch,
+            target_branch: dto.target_branch,
+            draft: dto.draft,
+            detailed_merge_status,
+            has_conflicts: dto.has_conflicts,
+            blocking_discussions_resolved: dto.blocking_discussions_resolved,
+            user_notes_count: dto.user_notes_count,
+            upvotes: dto.upvotes,
+            author_username: dto.author.username,
+            updated_at: dto.updated_at,
+            url: dto.web_url,
         }
     }
 }
@@ -356,6 +609,13 @@ impl Project {
                 pipeline.commit = Some(commit);
             }
         }
+    }
+
+    pub fn update_merge_requests(&mut self, merge_requests: Vec<MergeRequest>) {
+        self.merge_requests = merge_requests
+            .into_iter()
+            .sorted_by(|a, b| b.updated_at.cmp(&a.updated_at))
+            .collect();
     }
 }
 
@@ -458,13 +718,45 @@ impl Pipeline {
     }
 }
 
+fn append_mr_spans<'a>(
+    spans: &mut Vec<Span<'a>>,
+    mr: &'a MergeRequest,
+    default_branch: &str,
+) {
+    spans.push(Span::from(" "));
+    spans.push(Span::from(format!("!{}", mr.iid)).style(theme().mr_iid));
+
+    if mr.is_conflicted() {
+        spans.push(Span::from(" ⚡conflict").style(theme().mr_conflict));
+    } else if mr.draft {
+        spans.push(Span::from(" 📝draft").style(theme().mr_draft));
+    } else if mr.has_unresolved_threads() {
+        spans.push(Span::from(" 🔒threads").style(theme().mr_draft));
+    } else if mr.is_mergeable() {
+        spans.push(Span::from(" ✓").style(theme().mr_mergeable));
+    }
+
+    if mr.upvotes > 0 {
+        spans.push(Span::from(format!(" 👍{}", mr.upvotes)).style(theme().mr_mergeable));
+    }
+
+    if mr.user_notes_count > 0 {
+        spans.push(Span::from(format!(" 💬{}", mr.user_notes_count)).style(theme().mr_comments));
+    }
+
+    if !mr.target_branch.is_empty() && mr.target_branch != default_branch {
+        spans.push(Span::from(format!(" → {}", mr.target_branch)).style(theme().mr_target));
+    }
+}
+
 pub fn parse_row<'a>(
     project: &'a Project,
     max_pipelines: usize,
     include_mr_pipelines: bool,
 ) -> Row<'a> {
+    let max_rows = max_pipelines.max(1);
     let distinct_by_branch = project.first_pipeline_per_branch(
-        max_pipelines.max(1),
+        max_rows,
         include_mr_pipelines,
         |p| p.status.is_active(),
     );
@@ -474,8 +766,8 @@ pub fn parse_row<'a>(
         let branch = p.branch.as_str();
 
         let updated_at = p.updated_at.with_timezone(&Local);
-        match () {
-            _ if p.has_active_jobs() => Line::from(vec![
+        let mut spans = match () {
+            _ if p.has_active_jobs() => vec![
                 Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
                 Span::from(" "),
                 Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
@@ -487,8 +779,8 @@ pub fn parse_row<'a>(
                 Span::from(p.active_job_name()).style(theme().pipeline_job),
                 Span::from(" "),
                 Span::from(format_duration(p.duration())).style(theme().time),
-            ]),
-            _ if p.status.is_active() => Line::from(vec![
+            ],
+            _ if p.status.is_active() => vec![
                 Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
                 Span::from(" "),
                 Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
@@ -498,8 +790,8 @@ pub fn parse_row<'a>(
                 Span::from(branch).style(theme().pipeline_branch),
                 Span::from(" "),
                 Span::from(format_duration(p.duration())).style(theme().time),
-            ]),
-            _ => Line::from(vec![
+            ],
+            _ => vec![
                 Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
                 Span::from(" "),
                 Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
@@ -507,23 +799,90 @@ pub fn parse_row<'a>(
                 Span::from(icon),
                 Span::from(" "),
                 Span::from(branch).style(theme().pipeline_branch),
-            ]),
+            ],
+        };
+
+        if let Some(mr) = project.merge_request_for_branch(branch) {
+            append_mr_spans(&mut spans, mr, &project.default_branch);
         }
+
+        Line::from(spans)
     };
 
-    let pipeline_spans: Vec<Line<'a>> = distinct_by_branch
+    let mut pipeline_spans: Vec<Line<'a>> = distinct_by_branch
         .iter()
         .map(|p| pipeline_to_span(p))
         .collect();
 
+    // If there are open MRs whose source_branch did not appear in the recent pipelines list,
+    // fill remaining slots up to `max_rows` so open MRs are always visible.
+    if pipeline_spans.len() < max_rows && !project.merge_requests.is_empty() {
+        for mr in &project.merge_requests {
+            if pipeline_spans.len() >= max_rows {
+                break;
+            }
+            let already_shown = distinct_by_branch
+                .iter()
+                .any(|p| p.branch == mr.source_branch);
+            if !already_shown {
+                let updated_at = mr.updated_at.with_timezone(&Local);
+                let mut spans = vec![
+                    Span::from(updated_at.format("%a, %d %b").to_compact_string())
+                        .style(theme().date),
+                    Span::from(" "),
+                    Span::from(updated_at.format("%H:%M:%S").to_compact_string())
+                        .style(theme().time),
+                    Span::from(" 🟣 "),
+                    Span::from(mr.source_branch.as_str()).style(theme().pipeline_branch),
+                ];
+                append_mr_spans(&mut spans, mr, &project.default_branch);
+                pipeline_spans.push(Line::from(spans));
+            }
+        }
+    }
+
     let last_activity = project.last_activity_at.with_timezone(&Local);
 
+    let open_mr_line = if !project.merge_requests.is_empty() {
+        let conflicts = project
+            .merge_requests
+            .iter()
+            .filter(|mr| mr.is_conflicted())
+            .count();
+        if conflicts > 0 {
+            Some(Line::from(vec![
+                Span::from(format!("{} open MRs ", project.merge_requests.len()))
+                    .style(theme().mr_iid),
+                Span::from(format!("({conflicts} ⚡conflict)")).style(theme().mr_conflict),
+            ]))
+        } else {
+            Some(
+                Line::from(format!("{} open MRs", project.merge_requests.len()))
+                    .style(theme().mr_iid),
+            )
+        }
+    } else {
+        None
+    };
+
     let project_path = match project.path.rfind('/') {
-        Some(i) => Text::from(vec![
-            Line::from(&project.path[i + 1..]).style(theme().project_name),
-            Line::from(&project.path[0..=i]).style(theme().project_parents),
-        ]),
-        None => Text::from(Span::from(&project.path)).style(theme().project_name),
+        Some(i) => {
+            let mut lines = vec![
+                Line::from(&project.path[i + 1..]).style(theme().project_name),
+                Line::from(&project.path[0..=i]).style(theme().project_parents),
+            ];
+            if let Some(mr_line) = open_mr_line {
+                lines.push(mr_line);
+            }
+            Text::from(lines)
+        },
+        None => {
+            let mut lines = vec![Line::from(Span::from(&project.path)).style(theme().project_name)];
+            if let Some(mr_line) = open_mr_line {
+                lines.push(mr_line);
+            }
+            Text::from(lines)
+        },
     };
 
     let row_height = (pipeline_spans.len() as u16).max(3);

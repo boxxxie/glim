@@ -49,6 +49,18 @@ pub const fn default_true() -> bool {
     true
 }
 
+pub const fn default_projects_poll_seconds() -> u64 {
+    15
+}
+
+pub const fn default_jobs_poll_seconds() -> u64 {
+    10
+}
+
+pub const fn default_activity_feed_lines() -> u16 {
+    6
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GlimConfig {
     /// The URL of the GitLab instance
@@ -80,6 +92,21 @@ pub struct GlimConfig {
     /// Optional explicit blocklist of project paths or substrings
     #[serde(default)]
     pub exclude_projects: Option<Vec<CompactString>>,
+    /// Send desktop OS notifications via notify-send on pipeline/MR updates (default: true)
+    #[serde(default = "default_true")]
+    pub os_notifications: bool,
+    /// Ignore automated bot / linear-linkback comments in notifications & feed (default: true)
+    #[serde(default = "default_true")]
+    pub ignore_bot_comments: bool,
+    /// Polling interval in seconds for projects, pipelines, MRs, and events (default: 15)
+    #[serde(default = "default_projects_poll_seconds")]
+    pub projects_poll_seconds: u64,
+    /// Polling interval in seconds for active jobs (default: 10)
+    #[serde(default = "default_jobs_poll_seconds")]
+    pub jobs_poll_seconds: u64,
+    /// Number of lines in the bottom MR & repo activity feed panel (0 to hide, default: 6)
+    #[serde(default = "default_activity_feed_lines")]
+    pub activity_feed_lines: u16,
 }
 
 impl Default for GlimConfig {
@@ -96,6 +123,11 @@ impl Default for GlimConfig {
             include_mr_pipelines: true,
             include_projects: None,
             exclude_projects: None,
+            os_notifications: true,
+            ignore_bot_comments: true,
+            projects_poll_seconds: default_projects_poll_seconds(),
+            jobs_poll_seconds: default_jobs_poll_seconds(),
+            activity_feed_lines: default_activity_feed_lines(),
         }
     }
 }
@@ -175,6 +207,15 @@ impl GlimApp {
 
                 open::that(job_url).expect("unable to open browser");
             },
+            GlimEvent::MergeRequestOpenUrl(project_id, mr_iid) => {
+                debug!(project_id = %project_id, mr_iid = %mr_iid, "Opening merge request in browser");
+                let project = self.project(project_id);
+                let url = project
+                    .merge_request(mr_iid)
+                    .map(|mr| mr.url.to_string())
+                    .unwrap_or_else(|| format!("{}/-/merge_requests/{}", project.url, mr_iid));
+                open::that(&url).expect("unable to open browser");
+            },
 
             GlimEvent::JobLogFetch(project_id, pipeline_id) => {
                 debug!(project_id = %project_id, pipeline_id = %pipeline_id, "Downloading error log");
@@ -206,27 +247,21 @@ impl GlimApp {
                     .for_each(|p| self.gitlab.spawn_fetch_jobs(p.project_id, p.id));
             },
             GlimEvent::PipelinesFetch(id) => {
-                debug!(project_id = %id, "Requesting pipelines for project");
-                self.gitlab.spawn_fetch_pipelines(id, None)
+                debug!(project_id = %id, "Requesting pipelines, MRs, and events for project");
+                self.gitlab.spawn_fetch_pipelines(id, None);
+                self.gitlab.spawn_fetch_merge_requests(id);
+                self.gitlab.spawn_fetch_project_events(id);
+            },
+            GlimEvent::MergeRequestsFetch(id) => {
+                debug!(project_id = %id, "Requesting open merge requests for project");
+                self.gitlab.spawn_fetch_merge_requests(id);
+            },
+            GlimEvent::ProjectEventsFetch(id) => {
+                debug!(project_id = %id, "Requesting recent events for project");
+                self.gitlab.spawn_fetch_project_events(id);
             },
             GlimEvent::ProjectsFetch => {
-                let latest_activity = self
-                    .project_store
-                    .sorted_projects()
-                    .iter()
-                    .max_by_key(|p| p.last_activity_at)
-                    .map(|p| p.last_activity_at);
-
-                let updated_after = self
-                    .project_store
-                    .sorted_projects()
-                    .iter()
-                    .filter(|p| p.has_active_pipelines())
-                    .min_by_key(|p| p.last_activity_at)
-                    .map(|p| p.last_activity_at)
-                    .map_or_else(|| latest_activity, Some);
-
-                self.gitlab.spawn_fetch_projects(updated_after)
+                self.gitlab.spawn_fetch_projects(None)
             },
             GlimEvent::JobsFetch(project_id, pipeline_id) => {
                 debug!(project_id = %project_id, pipeline_id = %pipeline_id, "Requesting jobs for pipeline");
@@ -386,6 +421,10 @@ impl GlimApp {
 
     pub fn projects(&self) -> &[Project] {
         self.project_store.sorted_projects()
+    }
+
+    pub fn recent_activity(&self) -> &[crate::domain::ProjectActivityEvent] {
+        self.project_store.recent_activity()
     }
 
     pub fn filtered_projects(

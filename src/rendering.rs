@@ -13,7 +13,7 @@ use crate::{
     theme::theme,
     ui::{
         popup::{ConfigPopup, PipelineActionsPopup, ProjectDetailsPopup},
-        widget::{Notification, ProjectsTable},
+        widget::{ActivityFeed, Notification, ProjectsTable},
         StatefulWidgets,
     },
 };
@@ -52,6 +52,20 @@ fn render_projects_table(
     let (filtered_projects, filtered_indices) = app.filtered_projects(&effective_filter);
     widget_states.update_filtered_indices(filtered_indices);
 
+    let show_feed = widget_states.show_activity_feed && config.activity_feed_lines > 0;
+    let (projects_area, feed_area) = if show_feed && area.height > config.activity_feed_lines + 8 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(config.activity_feed_lines + 2),
+            ])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     let projects = ProjectsTable::new(
         &filtered_projects,
         widget_states.filter_input_active,
@@ -59,7 +73,16 @@ fn render_projects_table(
         config.max_pipelines_per_project,
         config.include_mr_pipelines,
     );
-    f.render_stateful_widget(projects, area, &mut widget_states.project_table_state);
+    f.render_stateful_widget(
+        projects,
+        projects_area,
+        &mut widget_states.project_table_state,
+    );
+
+    if let Some(feed_area) = feed_area {
+        let activity = ActivityFeed::new(app.recent_activity());
+        f.render_widget(activity, feed_area);
+    }
 }
 
 fn render_popups(
