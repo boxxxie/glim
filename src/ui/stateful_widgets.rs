@@ -109,6 +109,7 @@ impl StatefulWidgets {
             GlimEvent::ProjectPageDown => self.handle_project_selection(5, app),
             GlimEvent::ProjectPageUp => self.handle_project_selection(-5, app),
             GlimEvent::ProjectFirst => self.handle_project_first(app),
+            GlimEvent::ProjectLast => self.handle_project_last(app),
             GlimEvent::ActivityNext => self.handle_activity_selection(1, app),
             GlimEvent::ActivityPrevious => self.handle_activity_selection(-1, app),
             GlimEvent::ActivityPageDown => {
@@ -120,6 +121,7 @@ impl StatefulWidgets {
                 self.handle_activity_selection(-page, app);
             },
             GlimEvent::ActivityFirst => self.handle_activity_first(app),
+            GlimEvent::ActivityLast => self.handle_activity_last(app),
             GlimEvent::FocusToggle => {
                 if self.show_activity_feed {
                     self.activity_feed_focused = !self.activity_feed_focused;
@@ -370,6 +372,28 @@ impl StatefulWidgets {
         app.dispatch(GlimEvent::ProjectSelected(project.id));
     }
 
+    fn handle_project_last(&mut self, app: &GlimApp) {
+        let all_projects = app.projects();
+        let filtered_count = if self.current_filtered_indices.is_empty() {
+            all_projects.len()
+        } else {
+            self.current_filtered_indices.len()
+        };
+        if filtered_count == 0 {
+            return;
+        }
+        let last_idx = filtered_count - 1;
+        self.project_table_state.select(Some(last_idx));
+        let project_index = if self.current_filtered_indices.is_empty() {
+            last_idx
+        } else {
+            self.current_filtered_indices[last_idx]
+        };
+        let project = &all_projects[project_index];
+        self.selected_project_id = Some(project.id);
+        app.dispatch(GlimEvent::ProjectSelected(project.id));
+    }
+
     pub fn handle_pipeline_selection(&mut self, direction: i32) {
         if self.project_details.is_none() {
             return;
@@ -439,6 +463,26 @@ impl StatefulWidgets {
             .dispatch(GlimEvent::PipelineSelected(pipeline.id));
     }
 
+    pub fn handle_pipeline_end(&mut self) {
+        let Some(pd) = self.project_details.as_mut() else {
+            return;
+        };
+        let pipelines = pd
+            .project
+            .recent_pipelines(pd.max_recent_pipelines, pd.include_mr_pipelines);
+        if pipelines.is_empty() {
+            pd.pipelines_table_state.select(None);
+            pd.selected_pipeline_id = None;
+            return;
+        }
+        let last_idx = pipelines.len() - 1;
+        pd.pipelines_table_state.select(Some(last_idx));
+        let pipeline = &pipelines[last_idx];
+        pd.selected_pipeline_id = Some(pipeline.id);
+        self.sender
+            .dispatch(GlimEvent::PipelineSelected(pipeline.id));
+    }
+
     pub fn handle_pipeline_action_selection(&mut self, direction: i32) {
         if self.pipeline_actions.is_none() {
             return;
@@ -473,6 +517,26 @@ impl StatefulWidgets {
         if let Some(ad) = self.activity_details.as_mut() {
             let popup_area = ad.popup_area.clone();
             *ad = ActivityDetailsPopupState::new(events[0].clone(), popup_area);
+        }
+    }
+
+    pub fn handle_activity_last(&mut self, app: &GlimApp) {
+        let events = app.recent_activity();
+        if events.is_empty() {
+            self.activity_selected_index = None;
+            self.selected_activity_id = None;
+            return;
+        }
+        let last_idx = events.len() - 1;
+        self.activity_selected_index = Some(last_idx);
+        self.selected_activity_id = Some(events[last_idx].id);
+        if let Some(feed_rect) = self.last_feed_area {
+            let visible_rows = feed_rect.height.saturating_sub(2).max(1) as usize;
+            self.activity_feed_scroll = (last_idx + 1).saturating_sub(visible_rows);
+        }
+        if let Some(ad) = self.activity_details.as_mut() {
+            let popup_area = ad.popup_area.clone();
+            *ad = ActivityDetailsPopupState::new(events[last_idx].clone(), popup_area);
         }
     }
 

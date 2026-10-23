@@ -34,6 +34,7 @@ impl ProjectDetailsProcessor {
             KeyCode::PageUp => ui.handle_pipeline_page(-5),
             KeyCode::PageDown => ui.handle_pipeline_page(5),
             KeyCode::Home => ui.handle_pipeline_home(),
+            KeyCode::End => ui.handle_pipeline_end(),
             KeyCode::Enter if self.selected.is_some() => {
                 self.sender
                     .dispatch(GlimEvent::PipelineActionsOpen(

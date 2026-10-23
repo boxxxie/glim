@@ -46,11 +46,13 @@ impl NormalModeProcessor {
             KeyCode::PageUp if feed_focused => Some(GlimEvent::ActivityPageUp),
             KeyCode::PageDown if feed_focused => Some(GlimEvent::ActivityPageDown),
             KeyCode::Home if feed_focused => Some(GlimEvent::ActivityFirst),
+            KeyCode::End if feed_focused => Some(GlimEvent::ActivityLast),
             KeyCode::Up | KeyCode::Char('k') => Some(GlimEvent::ProjectPrevious),
             KeyCode::Down | KeyCode::Char('j') => Some(GlimEvent::ProjectNext),
             KeyCode::PageUp => Some(GlimEvent::ProjectPageUp),
             KeyCode::PageDown => Some(GlimEvent::ProjectPageDown),
             KeyCode::Home => Some(GlimEvent::ProjectFirst),
+            KeyCode::End => Some(GlimEvent::ProjectLast),
             KeyCode::Esc => Some(GlimEvent::FilterClear),
             _ => None,
         } {
