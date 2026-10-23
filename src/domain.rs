@@ -895,6 +895,57 @@ pub fn parse_row<'a>(
     .height(row_height)
 }
 
+#[derive(Clone, Debug)]
+pub enum RowEntryTarget {
+    MergeRequest(u64),
+    Pipeline(PipelineId),
+}
+
+impl Project {
+    /// Returns the ordered list of clickable targets for each pipeline/MR line rendered by `parse_row`
+    /// and the total row height in terminal lines.
+    pub fn row_targets_and_height(
+        &self,
+        max_pipelines: usize,
+        include_mr_pipelines: bool,
+    ) -> (Vec<RowEntryTarget>, u16) {
+        let max_rows = max_pipelines.max(1);
+        let distinct_by_branch = self.first_pipeline_per_branch(
+            max_rows,
+            include_mr_pipelines,
+            |p| p.status.is_active(),
+        );
+
+        let mut targets: Vec<RowEntryTarget> = distinct_by_branch
+            .iter()
+            .map(|p| {
+                if let Some(mr) = self.merge_request_for_branch(&p.branch) {
+                    RowEntryTarget::MergeRequest(mr.iid)
+                } else {
+                    RowEntryTarget::Pipeline(p.id)
+                }
+            })
+            .collect();
+
+        if targets.len() < max_rows && !self.merge_requests.is_empty() {
+            for mr in &self.merge_requests {
+                if targets.len() >= max_rows {
+                    break;
+                }
+                let already_shown = distinct_by_branch
+                    .iter()
+                    .any(|p| p.branch == mr.source_branch);
+                if !already_shown {
+                    targets.push(RowEntryTarget::MergeRequest(mr.iid));
+                }
+            }
+        }
+
+        let row_height = (targets.len() as u16).max(3);
+        (targets, row_height)
+    }
+}
+
 /// Represents types that can be associated with an icon.
 ///
 /// The icon returned is expected to be a string that may contain

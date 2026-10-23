@@ -106,6 +106,20 @@ impl NoticeService {
             GlimEvent::ActivityNotice(msg) => {
                 self.push_notice(NoticeLevel::Info, NoticeMessage::GeneralMessage(msg.clone()))
             },
+            GlimEvent::MergeRequestOpenUrl(_project_id, mr_iid) => {
+                self.push_notice(
+                    NoticeLevel::Info,
+                    NoticeMessage::GeneralMessage(format!("Opening MR !{} in browser", mr_iid).into()),
+                )
+            },
+            GlimEvent::PipelineOpenUrl(_project_id, pipeline_id) => {
+                self.push_notice(
+                    NoticeLevel::Info,
+                    NoticeMessage::GeneralMessage(
+                        format!("Opening pipeline #{} in browser", pipeline_id).into(),
+                    ),
+                )
+            },
             _ => {},
         }
     }

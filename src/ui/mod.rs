@@ -6,7 +6,7 @@ pub mod popup;
 mod stateful_widgets;
 pub mod widget;
 
-pub use stateful_widgets::StatefulWidgets;
+pub use stateful_widgets::{ClickAction, ClickRegion, StatefulWidgets};
 
 pub fn format_duration(duration: Duration) -> CompactString {
     let total_seconds = duration.abs().num_seconds();

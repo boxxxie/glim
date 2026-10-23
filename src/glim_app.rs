@@ -185,27 +185,25 @@ impl GlimApp {
             // www
             GlimEvent::ProjectOpenUrl(id) => {
                 debug!(project_id = %id, "Opening project in browser");
-                open::that(&self.project(id).url).expect("unable to open browser")
+                let _ = open::that(&self.project(id).url);
             },
             GlimEvent::PipelineOpenUrl(project_id, pipeline_id) => {
                 debug!(project_id = %project_id, pipeline_id = %pipeline_id, "Opening pipeline in browser");
                 let project = self.project(project_id);
-                let pipeline = project
-                    .pipeline(pipeline_id)
-                    .expect("pipeline not found");
-
-                open::that(&pipeline.url).expect("unable to open browser");
+                if let Some(pipeline) = project.pipeline(pipeline_id) {
+                    let _ = open::that(&pipeline.url);
+                }
             },
             GlimEvent::JobOpenUrl(project_id, pipeline_id, job_id) => {
                 debug!(project_id = %project_id, pipeline_id = %pipeline_id, job_id = %job_id, "Opening job in browser");
                 let project = self.project(project_id);
-                let job_url = project
+                if let Some(job_url) = project
                     .pipeline(pipeline_id)
                     .and_then(|p| p.job(job_id))
                     .map(|job| &job.url)
-                    .expect("job not found");
-
-                open::that(job_url).expect("unable to open browser");
+                {
+                    let _ = open::that(job_url);
+                }
             },
             GlimEvent::MergeRequestOpenUrl(project_id, mr_iid) => {
                 debug!(project_id = %project_id, mr_iid = %mr_iid, "Opening merge request in browser");
@@ -214,7 +212,7 @@ impl GlimApp {
                     .merge_request(mr_iid)
                     .map(|mr| mr.url.to_string())
                     .unwrap_or_else(|| format!("{}/-/merge_requests/{}", project.url, mr_iid));
-                open::that(&url).expect("unable to open browser");
+                let _ = open::that(&url);
             },
 
             GlimEvent::JobLogFetch(project_id, pipeline_id) => {

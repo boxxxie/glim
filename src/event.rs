@@ -1,7 +1,9 @@
 use std::{fmt::Debug, sync::mpsc, thread};
 
 use compact_str::CompactString;
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use tracing::Level;
 
 use crate::{
@@ -31,6 +33,7 @@ pub enum GlimEvent {
     #[allow(dead_code)]
     GlitchOverride(GlitchState),
     InputKey(KeyEvent),
+    InputMouse(MouseEvent),
     JobLogDownloaded(ProjectId, JobId, CompactString),
     JobLogFetch(ProjectId, PipelineId),
     JobOpenUrl(ProjectId, PipelineId, JobId),
@@ -88,6 +91,7 @@ impl GlimEvent {
             GlimEvent::FilterMenuShow => "FilterMenuShow",
             GlimEvent::GlitchOverride(_) => "GlitchOverride",
             GlimEvent::InputKey(_) => "InputKey",
+            GlimEvent::InputMouse(_) => "InputMouse",
             GlimEvent::JobLogDownloaded(_, _, _) => "JobLogDownloaded",
             GlimEvent::JobLogFetch(_, _) => "JobLogFetch",
             GlimEvent::JobOpenUrl(_, _, _) => "JobOpenUrl",
@@ -189,6 +193,16 @@ impl EventHandler {
         match event::read().expect("unable to read event") {
             CrosstermEvent::Key(e) if e.kind == KeyEventKind::Press => {
                 sender.send(GlimEvent::InputKey(e))
+            },
+            CrosstermEvent::Mouse(e)
+                if matches!(
+                    e.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                ) =>
+            {
+                sender.send(GlimEvent::InputMouse(e))
             },
 
             _ => Ok(()),

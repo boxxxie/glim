@@ -60,6 +60,7 @@ impl StatefulWidget for ProjectsTable<'_> {
                 ("p", "pipeline refresh"),
                 ("↑↓", "selection"),
                 ("↵", "details"),
+                ("click", "open mr/pipeline"),
             ])
         };
 

@@ -1,7 +1,11 @@
 use std::sync::mpsc::Sender;
 
 use compact_str::CompactString;
-use ratatui::widgets::TableState;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::{
+    layout::{Position, Rect},
+    widgets::TableState,
+};
 use tachyonfx::{Duration, RefRect};
 
 use crate::{
@@ -10,12 +14,33 @@ use crate::{
     effect_registry::EffectRegistry,
     event::GlimEvent,
     glim_app::{GlimApp, GlimConfig, Modulo},
-    id::PipelineId,
+    id::{PipelineId, ProjectId},
     ui::{
         popup::{ConfigPopupState, PipelineActionsPopupState, ProjectDetailsPopupState},
         widget::NotificationState,
     },
 };
+
+#[derive(Clone, Debug)]
+pub enum ClickAction {
+    SelectProjectAndDispatch {
+        table_row: usize,
+        project_id: ProjectId,
+        event: Option<GlimEvent>,
+    },
+    SelectPipelineAndDispatch {
+        table_row: usize,
+        pipeline_id: PipelineId,
+        event: GlimEvent,
+    },
+    Dispatch(Vec<GlimEvent>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ClickRegion {
+    pub area: Rect,
+    pub action: ClickAction,
+}
 
 pub struct StatefulWidgets {
     pub last_frame: Duration,
@@ -30,6 +55,7 @@ pub struct StatefulWidgets {
     pub temporary_filter: Option<CompactString>,
     pub capture_screen_requested: bool,
     pub show_activity_feed: bool,
+    pub click_regions: Vec<ClickRegion>,
     current_filtered_indices: Vec<usize>,
 }
 
@@ -48,12 +74,14 @@ impl StatefulWidgets {
             temporary_filter: None,
             capture_screen_requested: false,
             show_activity_feed: true,
+            click_regions: Vec::new(),
             current_filtered_indices: Vec::new(),
         }
     }
 
     pub fn apply(&mut self, app: &GlimApp, effects: &mut EffectRegistry, event: &GlimEvent) {
         match event {
+            GlimEvent::InputMouse(mouse) => self.handle_mouse_event(*mouse, app),
             GlimEvent::ProjectNext => self.handle_project_selection(1, app),
             GlimEvent::ProjectPrevious => self.handle_project_selection(-1, app),
             GlimEvent::ProjectsLoaded(_) => {
@@ -321,5 +349,70 @@ impl StatefulWidgets {
 
     pub fn update_filtered_indices(&mut self, indices: Vec<usize>) {
         self.current_filtered_indices = indices;
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, app: &GlimApp) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.pipeline_actions.is_some() {
+                    self.handle_pipeline_action_selection(-1);
+                } else if self.project_details.is_some() {
+                    self.handle_pipeline_selection(-1);
+                } else if self.config_popup_state.is_none() {
+                    self.handle_project_selection(-1, app);
+                }
+            },
+            MouseEventKind::ScrollDown => {
+                if self.pipeline_actions.is_some() {
+                    self.handle_pipeline_action_selection(1);
+                } else if self.project_details.is_some() {
+                    self.handle_pipeline_selection(1);
+                } else if self.config_popup_state.is_none() {
+                    self.handle_project_selection(1, app);
+                }
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Position::new(mouse.column, mouse.row);
+                let matched = self
+                    .click_regions
+                    .iter()
+                    .find(|region| region.area.contains(pos))
+                    .map(|r| r.action.clone());
+
+                if let Some(action) = matched {
+                    match action {
+                        ClickAction::SelectProjectAndDispatch {
+                            table_row,
+                            project_id,
+                            event,
+                        } => {
+                            self.project_table_state.select(Some(table_row));
+                            self.sender.dispatch(GlimEvent::ProjectSelected(project_id));
+                            if let Some(ev) = event {
+                                self.sender.dispatch(ev);
+                            }
+                        },
+                        ClickAction::SelectPipelineAndDispatch {
+                            table_row,
+                            pipeline_id,
+                            event,
+                        } => {
+                            if let Some(pd) = self.project_details.as_mut() {
+                                pd.pipelines_table_state.select(Some(table_row));
+                            }
+                            self.sender
+                                .dispatch(GlimEvent::PipelineSelected(pipeline_id));
+                            self.sender.dispatch(event);
+                        },
+                        ClickAction::Dispatch(events) => {
+                            for ev in events {
+                                self.sender.dispatch(ev);
+                            }
+                        },
+                    }
+                }
+            },
+            _ => {},
+        }
     }
 }

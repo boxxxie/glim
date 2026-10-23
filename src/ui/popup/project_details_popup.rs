@@ -128,6 +128,7 @@ impl StatefulWidget for ProjectDetailsPopup {
                 ("ESC", "close"),
                 ("↑ ↓", "selection"),
                 ("↵", "actions..."),
+                ("click", "open mr/pipeline"),
             ]),
         )
         .render(area, buf);
