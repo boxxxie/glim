@@ -11,11 +11,12 @@ use crate::{domain::ProjectActivityEvent, theme::theme};
 
 pub struct ActivityFeed<'a> {
     events: &'a [ProjectActivityEvent],
+    scroll_offset: usize,
 }
 
 impl<'a> ActivityFeed<'a> {
-    pub fn new(events: &'a [ProjectActivityEvent]) -> Self {
-        Self { events }
+    pub fn new(events: &'a [ProjectActivityEvent], scroll_offset: usize) -> Self {
+        Self { events, scroll_offset }
     }
 }
 
@@ -27,8 +28,14 @@ impl Widget for ActivityFeed<'_> {
 
         Clear.render(area, buf);
 
+        let title = if self.scroll_offset > 0 {
+            format!(" mr & repo activity (+{} scrolled) ", self.scroll_offset)
+        } else {
+            " mr & repo activity ".to_string()
+        };
+
         Block::new()
-            .title(" mr & repo activity ")
+            .title(title)
             .title_style(theme().border_title)
             .borders(Borders::ALL)
             .border_style(theme().table_border)
@@ -51,6 +58,7 @@ impl Widget for ActivityFeed<'_> {
         let lines: Vec<Line<'_>> = self
             .events
             .iter()
+            .skip(self.scroll_offset)
             .take(max_lines)
             .map(|ev| {
                 let local_ts = ev.created_at.with_timezone(&Local);

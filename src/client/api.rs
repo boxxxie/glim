@@ -150,7 +150,7 @@ impl GitlabApi {
         let url = {
             let config = self.config.read().unwrap();
             format_compact!(
-                "{}/projects/{}/events?per_page=25",
+                "{}/projects/{}/events?per_page=60",
                 config.base_url,
                 project_id
             )

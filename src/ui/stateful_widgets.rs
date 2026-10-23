@@ -55,6 +55,8 @@ pub struct StatefulWidgets {
     pub temporary_filter: Option<CompactString>,
     pub capture_screen_requested: bool,
     pub show_activity_feed: bool,
+    pub activity_feed_scroll: usize,
+    pub last_feed_area: Option<Rect>,
     pub click_regions: Vec<ClickRegion>,
     current_filtered_indices: Vec<usize>,
 }
@@ -74,6 +76,8 @@ impl StatefulWidgets {
             temporary_filter: None,
             capture_screen_requested: false,
             show_activity_feed: true,
+            activity_feed_scroll: 0,
+            last_feed_area: None,
             click_regions: Vec::new(),
             current_filtered_indices: Vec::new(),
         }
@@ -352,6 +356,7 @@ impl StatefulWidgets {
     }
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent, app: &GlimApp) {
+        let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if self.pipeline_actions.is_some() {
@@ -359,7 +364,11 @@ impl StatefulWidgets {
                 } else if self.project_details.is_some() {
                     self.handle_pipeline_selection(-1);
                 } else if self.config_popup_state.is_none() {
-                    self.handle_project_selection(-1, app);
+                    if self.last_feed_area.is_some_and(|r| r.contains(pos)) {
+                        self.activity_feed_scroll = self.activity_feed_scroll.saturating_sub(1);
+                    } else {
+                        self.handle_project_selection(-1, app);
+                    }
                 }
             },
             MouseEventKind::ScrollDown => {
@@ -368,11 +377,15 @@ impl StatefulWidgets {
                 } else if self.project_details.is_some() {
                     self.handle_pipeline_selection(1);
                 } else if self.config_popup_state.is_none() {
-                    self.handle_project_selection(1, app);
+                    if self.last_feed_area.is_some_and(|r| r.contains(pos)) {
+                        let max_scroll = app.recent_activity().len().saturating_sub(1);
+                        self.activity_feed_scroll = (self.activity_feed_scroll + 1).min(max_scroll);
+                    } else {
+                        self.handle_project_selection(1, app);
+                    }
                 }
             },
             MouseEventKind::Down(MouseButton::Left) => {
-                let pos = Position::new(mouse.column, mouse.row);
                 let matched = self
                     .click_regions
                     .iter()

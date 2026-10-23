@@ -20,7 +20,7 @@ use crate::{
     os_notify::{send_os_notification, NotifyUrgency},
 };
 
-const MAX_ACTIVITY_EVENTS: usize = 50;
+const MAX_ACTIVITY_EVENTS: usize = 100;
 
 pub struct ProjectStore {
     sender: Sender<GlimEvent>,

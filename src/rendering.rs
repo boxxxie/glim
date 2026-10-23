@@ -55,18 +55,35 @@ fn render_projects_table(
     widget_states.update_filtered_indices(filtered_indices);
 
     let show_feed = widget_states.show_activity_feed && config.activity_feed_lines > 0;
-    let (projects_area, feed_area) = if show_feed && area.height > config.activity_feed_lines + 8 {
+    let min_feed_h = (config.activity_feed_lines + 2).min(area.height.saturating_sub(6));
+    let (projects_area, feed_area) = if show_feed && area.height > 10 {
+        let content_rows: u16 = filtered_projects
+            .iter()
+            .map(|proj| {
+                proj.row_targets_and_height(
+                    config.max_pipelines_per_project,
+                    config.include_mr_pipelines,
+                )
+                .1
+            })
+            .sum();
+        let filter_h = if widget_states.filter_input_active { 3 } else { 0 };
+        let needed_projects_h = content_rows.max(4) + 3 + filter_h;
+        let max_projects_h = area.height.saturating_sub(min_feed_h).max(6);
+        let projects_h = needed_projects_h.min(max_projects_h);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(8),
-                Constraint::Length(config.activity_feed_lines + 2),
+                Constraint::Length(projects_h),
+                Constraint::Min(min_feed_h),
             ])
             .split(area);
         (chunks[0], Some(chunks[1]))
     } else {
         (area, None)
     };
+    widget_states.last_feed_area = feed_area;
 
     let projects = ProjectsTable::new(
         &filtered_projects,
@@ -82,7 +99,8 @@ fn render_projects_table(
     );
 
     if let Some(feed_area) = feed_area {
-        let activity = ActivityFeed::new(app.recent_activity());
+        let activity =
+            ActivityFeed::new(app.recent_activity(), widget_states.activity_feed_scroll);
         f.render_widget(activity, feed_area);
     }
 
@@ -200,6 +218,7 @@ fn update_main_click_regions(
         for (idx, ev) in app
             .recent_activity()
             .iter()
+            .skip(widget_states.activity_feed_scroll)
             .take(feed_inner.height as usize)
             .enumerate()
         {
