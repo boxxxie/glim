@@ -47,7 +47,7 @@ fn render_projects_table(
     widget_states: &mut StatefulWidgets,
     area: Rect,
 ) {
-    let config = app.load_config().unwrap_or_default();
+    let config = app.config();
     let effective_filter = widget_states.effective_filter(&config.search_filter);
     let (filtered_projects, filtered_indices) = app.filtered_projects(&effective_filter);
     widget_states.update_filtered_indices(filtered_indices);
@@ -56,6 +56,8 @@ fn render_projects_table(
         &filtered_projects,
         widget_states.filter_input_active,
         &widget_states.filter_input_text,
+        config.max_pipelines_per_project,
+        config.include_mr_pipelines,
     );
     f.render_stateful_widget(projects, area, &mut widget_states.project_table_state);
 }

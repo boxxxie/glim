@@ -8,6 +8,7 @@ use crate::{
     dispatcher::Dispatcher,
     domain::{Job, Pipeline, Project},
     event::GlimEvent,
+    glim_app::GlimConfig,
     id::ProjectId,
 };
 
@@ -16,28 +17,41 @@ pub struct ProjectStore {
     projects: Vec<Project>,
     project_id_lookup: HashMap<ProjectId, usize>,
     sorted: Vec<Project>, // todo: ref projects
+    max_recent_pipelines: usize,
+    include_mr_pipelines: bool,
+    auto_fetch_days: i64,
 }
 
 impl ProjectStore {
-    pub fn new(sender: Sender<GlimEvent>) -> Self {
+    pub fn new(sender: Sender<GlimEvent>, config: &GlimConfig) -> Self {
+        let auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
         Self {
             sender,
             projects: Vec::new(),
             // pipelines: Vec::new(),
             project_id_lookup: HashMap::new(),
             sorted: Vec::new(),
+            max_recent_pipelines: config.max_recent_pipelines,
+            include_mr_pipelines: config.include_mr_pipelines,
+            auto_fetch_days,
         }
     }
 
     #[instrument(skip(self, event), fields(event_type = %event.variant_name()))]
     pub fn apply(&mut self, event: &GlimEvent) {
         match event {
+            GlimEvent::ConfigUpdate(config) => {
+                self.max_recent_pipelines = config.max_recent_pipelines;
+                self.include_mr_pipelines = config.include_mr_pipelines;
+                self.auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
+            },
+
             // requests jobs for pipelines that have not been loaded yet
             GlimEvent::ProjectDetailsOpen(id) => {
                 debug!(project_id = %id, "Opening project details and requesting missing jobs");
                 let project = self.find(*id).unwrap();
                 project
-                    .recent_pipelines()
+                    .recent_pipelines(self.max_recent_pipelines, self.include_mr_pipelines)
                     .into_iter()
                     .filter(|p| p.jobs.is_none())
                     .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project.id, p.id)));
@@ -62,13 +76,18 @@ impl ProjectStore {
 
                 self.sorted = self.projects_sorted_by_last_activity();
                 if first_projects {
-                    self.dispatch(GlimEvent::ProjectSelected(self.sorted.first().unwrap().id));
+                    if let Some(first) = self.sorted.first() {
+                        self.dispatch(GlimEvent::ProjectSelected(first.id));
+                    }
                 }
             },
 
             // updates the pipelines for a project
             GlimEvent::PipelinesLoaded(pipelines) => {
-                let project_id = pipelines[0].project_id;
+                let Some(first_pipeline) = pipelines.first() else {
+                    return;
+                };
+                let project_id = first_pipeline.project_id;
                 debug!(project_id = %project_id, pipeline_count = pipelines.len(), "Processing received pipelines");
                 let sender = self.sender.clone();
 
@@ -100,14 +119,9 @@ impl ProjectStore {
                 let sender = self.sender.clone();
                 if let Some(project) = self.find_mut(*project_id) {
                     project.update_jobs(*pipeline_id, jobs);
-                    // todo: ugly, fix
-                    project.update_commit(
-                        *pipeline_id,
-                        job_dtos
-                            .first()
-                            .map(|j| j.commit.clone().into())
-                            .unwrap(),
-                    );
+                    if let Some(commit) = job_dtos.first().map(|j| j.commit.clone().into()) {
+                        project.update_commit(*pipeline_id, commit);
+                    }
                     sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())))
                 }
 
@@ -162,6 +176,7 @@ impl ProjectStore {
     #[instrument(skip(self, project), fields(project_id = %project.id, project_path = %project.path))]
     fn sync_project(&mut self, mut project: Project) {
         let sender = self.sender.clone();
+        let auto_fetch_days = self.auto_fetch_days;
         match self.find_mut(project.id) {
             Some(existing_entry) => {
                 sender.dispatch(GlimEvent::PipelinesFetch(project.id));
@@ -170,7 +185,7 @@ impl ProjectStore {
             None => {
                 self.project_id_lookup
                     .insert(project.id, self.projects.len());
-                if !is_older_than_7d(project.last_activity()) {
+                if !is_older_than_days(project.last_activity(), auto_fetch_days) {
                     sender.dispatch(GlimEvent::PipelinesFetch(project.id));
                     project.pipelines = Some(Vec::new());
                 }
@@ -180,8 +195,8 @@ impl ProjectStore {
     }
 }
 
-fn is_older_than_7d(date: DateTime<Utc>) -> bool {
-    Utc::now().signed_duration_since(date).num_days() > 7
+fn is_older_than_days(date: DateTime<Utc>, days: i64) -> bool {
+    Utc::now().signed_duration_since(date).num_days() > days
 }
 
 #[instrument(skip(event))]

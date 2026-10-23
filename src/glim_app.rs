@@ -25,6 +25,7 @@ use crate::{
 pub struct GlimApp {
     running: bool,
     config_path: PathBuf,
+    config: GlimConfig,
     gitlab: GitlabService,
     last_tick: std::time::Instant,
     sender: Sender<GlimEvent>,
@@ -36,19 +37,49 @@ pub struct GlimApp {
     current_log_level: tracing::Level,
 }
 
+pub const fn default_max_pipelines_per_project() -> usize {
+    6
+}
+
+pub const fn default_max_recent_pipelines() -> usize {
+    12
+}
+
+pub const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GlimConfig {
     /// The URL of the GitLab instance
     pub gitlab_url: CompactString,
     /// The Personal Access Token to authenticate with GitLab
     pub gitlab_token: CompactString,
-    /// Filter applied to the projects list
+    /// Filter applied to the projects list (supports comma-separated terms)
     pub search_filter: Option<CompactString>,
     /// Logging level: Off, Error, Warn, Info, Debug, Trace
     pub log_level: Option<CompactString>,
     /// Enable animations (default: true)
     #[serde(default)]
     pub animations: bool,
+    /// Maximum number of pipelines (branches/MRs) displayed per project in the main table
+    #[serde(default = "default_max_pipelines_per_project")]
+    pub max_pipelines_per_project: usize,
+    /// Maximum number of pipelines displayed in the project details popup
+    #[serde(default = "default_max_recent_pipelines")]
+    pub max_recent_pipelines: usize,
+    /// Hide projects with no activity in the last N days
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+    /// Include merge_request_event pipelines (default: true)
+    #[serde(default = "default_true")]
+    pub include_mr_pipelines: bool,
+    /// Optional explicit allowlist of project paths or substrings
+    #[serde(default)]
+    pub include_projects: Option<Vec<CompactString>>,
+    /// Optional explicit blocklist of project paths or substrings
+    #[serde(default)]
+    pub exclude_projects: Option<Vec<CompactString>>,
 }
 
 impl Default for GlimConfig {
@@ -59,6 +90,12 @@ impl Default for GlimConfig {
             search_filter: None,
             log_level: Some("Error".into()),
             animations: true,
+            max_pipelines_per_project: default_max_pipelines_per_project(),
+            max_recent_pipelines: default_max_recent_pipelines(),
+            max_age_days: None,
+            include_mr_pipelines: true,
+            include_projects: None,
+            exclude_projects: None,
         }
     }
 }
@@ -84,10 +121,11 @@ impl GlimApp {
         Self {
             running: true,
             config_path,
+            config: config.clone(),
             gitlab,
             last_tick: std::time::Instant::now(),
             sender: sender.clone(),
-            project_store: ProjectStore::new(sender),
+            project_store: ProjectStore::new(sender, config),
             notices: NoticeService::new(),
             input,
             clipboard: arboard::Clipboard::new().expect("failed to create clipboard"),
@@ -198,6 +236,7 @@ impl GlimApp {
 
             // configuration
             GlimEvent::ConfigUpdate(config) => {
+                self.config = config.clone();
                 let client_config = ClientConfig::from(config.clone())
                     .with_debug_logging(self.gitlab.config().debug.log_responses);
                 let _ = self.gitlab.update_config(client_config);
@@ -312,6 +351,10 @@ impl GlimApp {
         }
     }
 
+    pub fn config(&self) -> &GlimConfig {
+        &self.config
+    }
+
     pub fn load_config(&self) -> Result<GlimConfig, GlimError> {
         let config_file = &self.config_path;
         if config_file.exists() {
@@ -350,33 +393,100 @@ impl GlimApp {
         temporary_filter: &Option<CompactString>,
     ) -> (Vec<Project>, Vec<usize>) {
         let all_projects = self.project_store.sorted_projects();
+        let now = chrono::Utc::now();
 
-        if let Some(filter) = temporary_filter {
-            if !filter.trim().is_empty() {
-                let filter_lower = filter.to_lowercase();
-                let mut filtered_projects = Vec::new();
-                let mut filtered_indices = Vec::new();
+        let search_terms: Vec<String> = temporary_filter
+            .as_ref()
+            .map(|f| {
+                f.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
 
-                for (index, project) in all_projects.iter().enumerate() {
-                    if project
-                        .path
-                        .to_lowercase()
-                        .contains(filter_lower.as_str())
-                        || project
-                            .description
-                            .as_ref()
-                            .is_some_and(|d| d.to_lowercase().contains(filter_lower.as_str()))
-                    {
-                        filtered_projects.push(project.clone());
-                        filtered_indices.push(index);
+        let include_terms: Vec<String> = self
+            .config
+            .include_projects
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let exclude_terms: Vec<String> = self
+            .config
+            .exclude_projects
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut filtered_projects = Vec::new();
+        let mut filtered_indices = Vec::new();
+
+        for (index, project) in all_projects.iter().enumerate() {
+            // 1. Check max_age_days cutoff
+            if let Some(max_age) = self.config.max_age_days {
+                if max_age > 0 {
+                    let age_days = now
+                        .signed_duration_since(project.last_activity_at)
+                        .num_days();
+                    if age_days > max_age as i64 {
+                        continue;
                     }
                 }
-
-                return (filtered_projects, filtered_indices);
             }
+
+            let path_lower = project.path.to_lowercase();
+            let desc_lower = project
+                .description
+                .as_ref()
+                .map(|d| d.to_lowercase());
+
+            // 2. Check exclude_projects blocklist
+            if !exclude_terms.is_empty()
+                && exclude_terms
+                    .iter()
+                    .any(|term| path_lower.contains(term.as_str()))
+            {
+                continue;
+            }
+
+            // 3. Check include_projects allowlist
+            if !include_terms.is_empty()
+                && !include_terms
+                    .iter()
+                    .any(|term| path_lower.contains(term.as_str()))
+            {
+                continue;
+            }
+
+            // 4. Check search_filter / temporary_filter (supports comma-separated terms)
+            if !search_terms.is_empty() {
+                let matches_search = search_terms.iter().any(|term| {
+                    path_lower.contains(term.as_str())
+                        || desc_lower
+                            .as_ref()
+                            .is_some_and(|d| d.contains(term.as_str()))
+                });
+                if !matches_search {
+                    continue;
+                }
+            }
+
+            filtered_projects.push(project.clone());
+            filtered_indices.push(index);
         }
 
-        (all_projects.to_vec(), (0..all_projects.len()).collect())
+        (filtered_projects, filtered_indices)
     }
 
     pub fn sender(&self) -> Sender<GlimEvent> {

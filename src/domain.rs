@@ -186,7 +186,15 @@ impl PipelineStatus {
 }
 
 impl PipelineSource {
-    pub(crate) fn is_interesting(&self) -> bool {
+    pub(crate) fn is_interesting(&self, include_mr_pipelines: bool) -> bool {
+        if include_mr_pipelines
+            && matches!(
+                self,
+                PipelineSource::MergeRequestEvent | PipelineSource::ExternalPullRequestEvent
+            )
+        {
+            return true;
+        }
         matches!(
             self,
             PipelineSource::Api
@@ -225,12 +233,13 @@ impl Project {
     pub fn first_pipeline_per_branch(
         &self,
         count: usize,
+        include_mr_pipelines: bool,
         predicate: impl Fn(&Pipeline) -> bool,
     ) -> Vec<&Pipeline> {
         if let Some(pipelines) = self.pipelines.as_ref() {
             pipelines
                 .iter()
-                .filter(|p| p.source.is_interesting() || predicate(p))
+                .filter(|p| p.source.is_interesting(include_mr_pipelines) || predicate(p))
                 .unique_by(|p| &p.branch)
                 .take(count)
                 .collect()
@@ -239,12 +248,12 @@ impl Project {
         }
     }
 
-    pub fn recent_pipelines(&self) -> Vec<&Pipeline> {
+    pub fn recent_pipelines(&self, max_count: usize, include_mr_pipelines: bool) -> Vec<&Pipeline> {
         if let Some(pipelines) = self.pipelines.as_ref() {
             pipelines
                 .iter()
-                .filter(|p| p.source.is_interesting())
-                .take(8)
+                .filter(|p| p.source.is_interesting(include_mr_pipelines))
+                .take(max_count)
                 .collect()
         } else {
             Vec::new()
@@ -449,8 +458,16 @@ impl Pipeline {
     }
 }
 
-pub fn parse_row<'a>(project: &'a Project) -> Row<'a> {
-    let distinct_by_branch = project.first_pipeline_per_branch(3, |p| p.status.is_active());
+pub fn parse_row<'a>(
+    project: &'a Project,
+    max_pipelines: usize,
+    include_mr_pipelines: bool,
+) -> Row<'a> {
+    let distinct_by_branch = project.first_pipeline_per_branch(
+        max_pipelines.max(1),
+        include_mr_pipelines,
+        |p| p.status.is_active(),
+    );
 
     let pipeline_to_span = |p: &'a Pipeline| -> Line<'a> {
         let icon = p.status.icon();
@@ -509,12 +526,14 @@ pub fn parse_row<'a>(project: &'a Project) -> Row<'a> {
         None => Text::from(Span::from(&project.path)).style(theme().project_name),
     };
 
+    let row_height = (pipeline_spans.len() as u16).max(3);
+
     Row::new(vec![
         text_from(last_activity),
         project_path,
         Text::from(pipeline_spans),
     ])
-    .height(3)
+    .height(row_height)
 }
 
 /// Represents types that can be associated with an icon.

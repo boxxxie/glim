@@ -27,6 +27,7 @@ pub struct ConfigPopupState {
     input_fields: Vec<InputField>,
     pub error_message: Option<CompactString>,
     pub popup_area: RefRect,
+    base_config: GlimConfig,
 }
 
 impl ConfigPopup {
@@ -103,20 +104,41 @@ impl ConfigPopupState {
                             .unwrap_or_default(),
                     ))
                     .into(),
+                InputField::builder()
+                    .label("max pipelines per repo")
+                    .description(Some(max_pipelines_description()))
+                    .input(Input::new(config.max_pipelines_per_project.to_string()))
+                    .into(),
+                InputField::builder()
+                    .label("max project age (days)")
+                    .description(Some(max_age_description()))
+                    .input(Input::new(
+                        config
+                            .max_age_days
+                            .map(|d| d.to_string())
+                            .unwrap_or_default(),
+                    ))
+                    .into(),
                 log_level_field,
                 animations_field,
             ],
             popup_area,
+            base_config: config,
         }
     }
 
     pub fn select_next_input(&mut self) {
-        self.active_input_idx = (self.active_input_idx + 1) % 5;
+        let len = self.input_fields.len() as u16;
+        self.active_input_idx = (self.active_input_idx + 1) % len;
     }
 
     pub fn select_previous_input(&mut self) {
-        self.active_input_idx =
-            if self.active_input_idx == 0 { 4 } else { self.active_input_idx - 1 };
+        let len = self.input_fields.len() as u16;
+        self.active_input_idx = if self.active_input_idx == 0 {
+            len.saturating_sub(1)
+        } else {
+            self.active_input_idx - 1
+        };
     }
 
     pub fn cycle_dropdown_next(&mut self) {
@@ -165,13 +187,27 @@ impl ConfigPopupState {
             .trim()
             .to_compact_string();
         let search_filter_value = values.get(2).unwrap_or(&"").trim();
-        let log_level_value = values.get(3).unwrap_or(&"Off").trim();
-        let animations_value = values.get(4).unwrap_or(&"true").trim();
+        let max_pipelines_value = values.get(3).unwrap_or(&"6").trim();
+        let max_age_value = values.get(4).unwrap_or(&"").trim();
+        let log_level_value = values.get(5).unwrap_or(&"Off").trim();
+        let animations_value = values.get(6).unwrap_or(&"true").trim();
 
         let search_filter = if search_filter_value.is_empty() {
             None
         } else {
             Some(search_filter_value.to_compact_string())
+        };
+
+        let max_pipelines_per_project = max_pipelines_value
+            .parse::<usize>()
+            .ok()
+            .filter(|&v| v > 0)
+            .unwrap_or(self.base_config.max_pipelines_per_project);
+
+        let max_age_days = if max_age_value.is_empty() {
+            None
+        } else {
+            max_age_value.parse::<u32>().ok().filter(|&v| v > 0)
         };
 
         let log_level = if log_level_value.is_empty() {
@@ -188,6 +224,12 @@ impl ConfigPopupState {
             search_filter,
             log_level,
             animations,
+            max_pipelines_per_project,
+            max_recent_pipelines: self.base_config.max_recent_pipelines,
+            max_age_days,
+            include_mr_pipelines: self.base_config.include_mr_pipelines,
+            include_projects: self.base_config.include_projects.clone(),
+            exclude_projects: self.base_config.exclude_projects.clone(),
         }
     }
 
@@ -209,7 +251,8 @@ impl ConfigPopupState {
     }
 
     pub fn update_popup_area(&self, screen: Rect) -> Rect {
-        let area = screen.inner_centered(80, 18);
+        let height = (self.input_fields.len() as u16 * 3) + 3;
+        let area = screen.inner_centered(80, height);
         self.popup_area.set(area);
         area
     }
@@ -278,7 +321,21 @@ fn token_description() -> Line<'static> {
 
 fn filter_description() -> Line<'static> {
     Line::from(vec![Span::from(
-        "optional project filter, applied to project namespace",
+        "optional project filter (comma-separated terms supported)",
+    )
+    .style(theme().input_description)])
+}
+
+fn max_pipelines_description() -> Line<'static> {
+    Line::from(vec![Span::from(
+        "number of branch/MR pipelines shown per project row (e.g. 5-10)",
+    )
+    .style(theme().input_description)])
+}
+
+fn max_age_description() -> Line<'static> {
+    Line::from(vec![Span::from(
+        "hide repos inactive for more than N days (leave empty for all)",
     )
     .style(theme().input_description)])
 }

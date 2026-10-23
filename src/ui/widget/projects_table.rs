@@ -20,11 +20,17 @@ pub struct ProjectsTable<'a> {
 }
 
 impl<'a> ProjectsTable<'a> {
-    pub fn new(projects: &'a [Project], filter_active: bool, filter_text: &'a str) -> Self {
+    pub fn new(
+        projects: &'a [Project],
+        filter_active: bool,
+        filter_text: &'a str,
+        max_pipelines_per_project: usize,
+        include_mr_pipelines: bool,
+    ) -> Self {
         Self {
             rows: projects
                 .iter()
-                .map(|proj| parse_row(proj))
+                .map(|proj| parse_row(proj, max_pipelines_per_project, include_mr_pipelines))
                 .enumerate()
                 .map(|(idx, r)| r.style(theme().table_row(idx)))
                 .collect(),

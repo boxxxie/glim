@@ -17,6 +17,8 @@ pub struct ClientConfig {
     pub private_token: CompactString,
     /// Optional search filter for projects
     pub search_filter: Option<CompactString>,
+    /// Optional max age in days for projects
+    pub max_age_days: Option<u32>,
     /// Polling configuration
     pub polling: PollingConfig,
     /// Request configuration
@@ -156,6 +158,7 @@ impl ClientConfig {
             base_url: base_url.into(),
             private_token: private_token.into(),
             search_filter: None,
+            max_age_days: None,
             polling: PollingConfig::default(),
             request: RequestConfig::default(),
             debug: DebugConfig::default(),
@@ -220,14 +223,30 @@ impl ClientConfig {
 
     /// Create default project query with config values
     pub fn default_project_query(&self) -> ProjectQuery {
+        // Only send search_filter to GitLab API if it is a single term (no commas);
+        // multi-term comma-separated filters are evaluated client-side.
+        let api_search_filter = self
+            .search_filter
+            .as_ref()
+            .filter(|f| !f.contains(','))
+            .cloned();
+
+        let updated_after = self.max_age_days.and_then(|days| {
+            if days > 0 {
+                Some(Utc::now() - chrono::Duration::days(days as i64))
+            } else {
+                None
+            }
+        });
+
         ProjectQuery {
-            search_filter: self.search_filter.clone(),
+            search_filter: api_search_filter,
+            updated_after,
             per_page: self.request.per_page,
             include_statistics: true,
             archived: false,
             membership: true,
             search_namespaces: true,
-            ..Default::default()
         }
     }
 
@@ -242,7 +261,9 @@ impl ClientConfig {
 
 impl From<GlimConfig> for ClientConfig {
     fn from(config: GlimConfig) -> Self {
-        Self::new(config.gitlab_url, config.gitlab_token).with_search_filter(config.search_filter)
+        Self::new(config.gitlab_url, config.gitlab_token)
+            .with_search_filter(config.search_filter)
+            .with_max_age_days(config.max_age_days)
     }
 }
 
@@ -251,6 +272,12 @@ impl ClientConfig {
     /// Set search filter
     pub fn with_search_filter(mut self, filter: Option<CompactString>) -> Self {
         self.search_filter = filter;
+        self
+    }
+
+    /// Set max age in days for projects
+    pub fn with_max_age_days(mut self, max_age_days: Option<u32>) -> Self {
+        self.max_age_days = max_age_days;
         self
     }
 
@@ -289,7 +316,12 @@ impl ProjectQuery {
 
     /// Set updated after filter
     pub fn with_updated_after(mut self, updated_after: Option<DateTime<Utc>>) -> Self {
-        self.updated_after = updated_after;
+        if let Some(ts) = updated_after {
+            self.updated_after = Some(match self.updated_after {
+                Some(existing) if existing > ts => existing,
+                _ => ts,
+            });
+        }
         self
     }
 
@@ -310,7 +342,12 @@ impl PipelineQuery {
 
     /// Set updated after filter
     pub fn with_updated_after(mut self, updated_after: Option<DateTime<Utc>>) -> Self {
-        self.updated_after = updated_after;
+        if let Some(ts) = updated_after {
+            self.updated_after = Some(match self.updated_after {
+                Some(existing) if existing > ts => existing,
+                _ => ts,
+            });
+        }
         self
     }
 
@@ -357,6 +394,7 @@ mod tests {
             search_filter: Some("test".into()),
             log_level: Some("Off".into()),
             animations: true,
+            ..Default::default()
         };
 
         let client_config = ClientConfig::from(glim_config);

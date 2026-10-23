@@ -25,6 +25,8 @@ pub struct ProjectDetailsPopupState {
     pub pipelines: PipelineTable, // widget
     pub pipelines_table_state: TableState,
     pub popup_area: RefRect,
+    pub max_recent_pipelines: usize,
+    pub include_mr_pipelines: bool,
 }
 
 impl ProjectDetailsPopup {
@@ -35,10 +37,20 @@ impl ProjectDetailsPopup {
 
 impl ProjectDetailsPopupState {
     pub fn with_project(&self, project: Project) -> Self {
-        Self::new(project, self.popup_area.clone())
+        Self::new(
+            project,
+            self.popup_area.clone(),
+            self.max_recent_pipelines,
+            self.include_mr_pipelines,
+        )
     }
 
-    pub fn new(project: Project, popup_area: RefRect) -> ProjectDetailsPopupState {
+    pub fn new(
+        project: Project,
+        popup_area: RefRect,
+        max_recent_pipelines: usize,
+        include_mr_pipelines: bool,
+    ) -> ProjectDetailsPopupState {
         let (namespace, name) = project.path_and_name();
         let description = match &project.description {
             Some(d) => d.to_string(),
@@ -56,7 +68,8 @@ impl ProjectDetailsPopupState {
             Self::storage_size_line(project.artifacts_size_kb, "in artifacts"),
         ]);
 
-        let pipelines: Vec<&Pipeline> = project.recent_pipelines();
+        let pipelines: Vec<&Pipeline> =
+            project.recent_pipelines(max_recent_pipelines, include_mr_pipelines);
         let pipelines = PipelineTable::new(&pipelines);
 
         ProjectDetailsPopupState {
@@ -66,6 +79,8 @@ impl ProjectDetailsPopupState {
             pipelines,
             pipelines_table_state: TableState::default().with_selected(0),
             popup_area,
+            max_recent_pipelines,
+            include_mr_pipelines,
         }
     }
 
@@ -140,10 +155,11 @@ impl StatefulWidget for ProjectDetailsPopup {
             .clone()
             .render(project_details_layout[1], buf);
 
-        PipelineTable::new(&state.project.recent_pipelines()).render(
-            outer_layout[1],
-            buf,
-            &mut state.pipelines_table_state,
-        );
+        PipelineTable::new(
+            &state
+                .project
+                .recent_pipelines(state.max_recent_pipelines, state.include_mr_pipelines),
+        )
+        .render(outer_layout[1], buf, &mut state.pipelines_table_state);
     }
 }

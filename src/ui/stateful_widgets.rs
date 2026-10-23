@@ -61,7 +61,13 @@ impl StatefulWidgets {
             GlimEvent::ProjectDetailsOpen(id) => {
                 let popup_area = RefRect::default();
                 effects.register_project_details(popup_area.clone());
-                self.open_project_details(app.project(*id).clone(), popup_area, app.sender())
+                self.open_project_details(
+                    app.project(*id).clone(),
+                    popup_area,
+                    app.sender(),
+                    app.config().max_recent_pipelines,
+                    app.config().include_mr_pipelines,
+                )
             },
             GlimEvent::ProjectDetailsClose => self.project_details = None,
             GlimEvent::ProjectUpdated(p) => self.refresh_project_details(p),
@@ -121,14 +127,21 @@ impl StatefulWidgets {
         project: Project,
         area_tracker: RefRect,
         sender: Sender<GlimEvent>,
+        max_recent_pipelines: usize,
+        include_mr_pipelines: bool,
     ) {
         project
-            .recent_pipelines()
+            .recent_pipelines(max_recent_pipelines, include_mr_pipelines)
             .first()
             .map(|p| sender.dispatch(GlimEvent::PipelineSelected(p.id)))
             .unwrap_or(());
 
-        self.project_details = Some(ProjectDetailsPopupState::new(project, area_tracker));
+        self.project_details = Some(ProjectDetailsPopupState::new(
+            project,
+            area_tracker,
+            max_recent_pipelines,
+            include_mr_pipelines,
+        ));
     }
 
     fn open_config(&mut self, config: GlimConfig, popup_area: RefRect) {
@@ -209,7 +222,9 @@ impl StatefulWidgets {
         let pd = self.project_details.as_mut().unwrap();
 
         if let Some(current) = pd.pipelines_table_state.selected() {
-            let pipelines = pd.project.recent_pipelines();
+            let pipelines = pd
+                .project
+                .recent_pipelines(pd.max_recent_pipelines, pd.include_mr_pipelines);
 
             let new_index = (current as i32 + direction).modulo(pipelines.len() as i32) as usize;
 
