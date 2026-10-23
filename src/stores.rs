@@ -25,9 +25,6 @@ use crate::{
     os_notify::{send_os_notification, NotifyUrgency},
 };
 
-const MAX_ACTIVITY_EVENTS: usize = 1000;
-const MAX_CACHED_COMMITS: usize = 1000;
-
 pub struct ProjectStore {
     sender: Sender<GlimEvent>,
     cache_dir: Option<PathBuf>,
@@ -353,11 +350,9 @@ impl ProjectStore {
                 for ev in pipeline_feed_events {
                     self.recent_activity.push(ev);
                 }
-                self.recent_activity
-                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
-                self.save_activity_cache();
                 if has_pipeline_events {
+                    self.recent_activity
+                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                     self.save_activity_cache();
                 }
 
@@ -462,6 +457,7 @@ impl ProjectStore {
                 };
 
                 let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                let mut added_any = false;
                 let current_username = self.current_username.clone();
 
                 for dto in event_dtos {
@@ -495,14 +491,16 @@ impl ProjectStore {
                         }
                         if !already_present {
                             self.recent_activity.push(activity);
+                            added_any = true;
                         }
                     }
                 }
 
-                self.recent_activity
-                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
-                self.save_activity_cache();
+                if added_any {
+                    self.recent_activity
+                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                    self.save_activity_cache();
+                }
 
                 // Emit notifications for newly arrived events in chronological order
                 newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -538,6 +536,7 @@ impl ProjectStore {
                 self.last_seen_todo_id = Some(max_todo_id);
 
                 let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                let mut added_any = false;
                 let current_username = self.current_username.clone();
                 for todo in todos {
                     if let Some(activity) = convert_gitlab_todo(todo, &current_username) {
@@ -552,14 +551,16 @@ impl ProjectStore {
                         }
                         if !already_present {
                             self.recent_activity.push(activity);
+                            added_any = true;
                         }
                     }
                 }
 
-                self.recent_activity
-                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
-                self.save_activity_cache();
+                if added_any {
+                    self.recent_activity
+                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                    self.save_activity_cache();
+                }
 
                 newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
                 for ev in newly_arrived {
@@ -768,7 +769,6 @@ impl ProjectStore {
         if !self.recent_activity.is_empty() {
             self.recent_activity
                 .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
             self.startup_notified = true;
         }
     }
@@ -790,10 +790,7 @@ impl ProjectStore {
 
     fn save_commits_cache(&self) {
         if let Some(ref dir) = self.cache_dir {
-            write_jsonl(
-                &dir.join("commits.jsonl"),
-                self.commits.values().take(MAX_CACHED_COMMITS),
-            );
+            write_jsonl(&dir.join("commits.jsonl"), self.commits.values());
         }
     }
 }
