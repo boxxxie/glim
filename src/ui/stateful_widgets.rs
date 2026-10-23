@@ -46,6 +46,7 @@ pub struct StatefulWidgets {
     pub last_frame: Duration,
     pub sender: Sender<GlimEvent>,
     pub project_table_state: TableState,
+    pub selected_project_id: Option<ProjectId>,
     pub config_popup_state: Option<ConfigPopupState>,
     pub project_details: Option<ProjectDetailsPopupState>,
     pub pipeline_actions: Option<PipelineActionsPopupState>,
@@ -67,6 +68,7 @@ impl StatefulWidgets {
             last_frame: Duration::default(),
             sender,
             project_table_state: TableState::default().with_selected(0),
+            selected_project_id: None,
             config_popup_state: None,
             project_details: None,
             pipeline_actions: None,
@@ -153,7 +155,14 @@ impl StatefulWidgets {
 
         if requires_refresh {
             let existing = self.project_details.take().unwrap();
-            self.project_details = Some(existing.with_project(project.clone()));
+            let prev_pipeline_id = existing.selected_pipeline_id;
+            let next = existing.with_project(project.clone());
+            if next.selected_pipeline_id != prev_pipeline_id {
+                if let Some(pid) = next.selected_pipeline_id {
+                    self.sender.dispatch(GlimEvent::PipelineSelected(pid));
+                }
+            }
+            self.project_details = Some(next);
         }
     }
 
@@ -246,6 +255,7 @@ impl StatefulWidgets {
             };
 
             let project = &all_projects[project_index];
+            self.selected_project_id = Some(project.id);
             app.dispatch(GlimEvent::ProjectSelected(project.id));
         } else {
             self.project_table_state.select(Some(0));
@@ -267,9 +277,11 @@ impl StatefulWidgets {
 
             if pipelines.is_empty() {
                 pd.pipelines_table_state.select(None);
+                pd.selected_pipeline_id = None;
             } else {
                 pd.pipelines_table_state.select(Some(new_index));
                 let pipeline = &pipelines[new_index];
+                pd.selected_pipeline_id = Some(pipeline.id);
                 self.sender
                     .dispatch(GlimEvent::PipelineSelected(pipeline.id));
             }
@@ -311,6 +323,7 @@ impl StatefulWidgets {
                 Some(self.filter_input_text.clone())
             };
             self.temporary_filter = filter;
+            self.selected_project_id = None;
             self.project_table_state.select(Some(0)); // Reset selection to first item
         }
     }
@@ -325,6 +338,7 @@ impl StatefulWidgets {
                 Some(self.filter_input_text.clone())
             };
             self.temporary_filter = filter;
+            self.selected_project_id = None;
             self.project_table_state.select(Some(0)); // Reset selection to first item
         }
     }
@@ -332,6 +346,7 @@ impl StatefulWidgets {
     fn apply_temporary_filter(&mut self, filter: Option<CompactString>) {
         self.temporary_filter = filter;
         self.filter_input_active = false;
+        self.selected_project_id = None;
         // Reset table selection when filter changes
         self.project_table_state.select(Some(0));
     }
@@ -400,6 +415,7 @@ impl StatefulWidgets {
                             event,
                         } => {
                             self.project_table_state.select(Some(table_row));
+                            self.selected_project_id = Some(project_id);
                             self.sender.dispatch(GlimEvent::ProjectSelected(project_id));
                             if let Some(ev) = event {
                                 self.sender.dispatch(ev);
@@ -412,6 +428,7 @@ impl StatefulWidgets {
                         } => {
                             if let Some(pd) = self.project_details.as_mut() {
                                 pd.pipelines_table_state.select(Some(table_row));
+                                pd.selected_pipeline_id = Some(pipeline_id);
                             }
                             self.sender
                                 .dispatch(GlimEvent::PipelineSelected(pipeline_id));

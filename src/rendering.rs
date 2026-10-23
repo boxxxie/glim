@@ -54,6 +54,34 @@ fn render_projects_table(
     let (filtered_projects, filtered_indices) = app.filtered_projects(&effective_filter);
     widget_states.update_filtered_indices(filtered_indices);
 
+    if filtered_projects.is_empty() {
+        widget_states.project_table_state.select(None);
+    } else if let Some(sel_id) = widget_states.selected_project_id {
+        if let Some(idx) = filtered_projects.iter().position(|p| p.id == sel_id) {
+            widget_states.project_table_state.select(Some(idx));
+        } else {
+            let clamped = widget_states
+                .project_table_state
+                .selected()
+                .unwrap_or(0)
+                .min(filtered_projects.len() - 1);
+            widget_states.project_table_state.select(Some(clamped));
+            let new_id = filtered_projects[clamped].id;
+            widget_states.selected_project_id = Some(new_id);
+            widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
+        }
+    } else {
+        let idx = widget_states
+            .project_table_state
+            .selected()
+            .unwrap_or(0)
+            .min(filtered_projects.len() - 1);
+        widget_states.project_table_state.select(Some(idx));
+        let new_id = filtered_projects[idx].id;
+        widget_states.selected_project_id = Some(new_id);
+        widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
+    }
+
     let show_feed = widget_states.show_activity_feed && config.activity_feed_lines > 0;
     let min_feed_h = (config.activity_feed_lines + 2).min(area.height.saturating_sub(6));
     let (projects_area, feed_area) = if show_feed && area.height > 10 {

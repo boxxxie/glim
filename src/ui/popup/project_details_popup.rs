@@ -10,6 +10,7 @@ use tachyonfx::RefRect;
 
 use crate::{
     domain::{Pipeline, Project},
+    id::PipelineId,
     theme::theme,
     ui::{fx::popup_window, popup::utility::CenteredShrink, widget::PipelineTable},
 };
@@ -24,6 +25,7 @@ pub struct ProjectDetailsPopupState {
     project_stat_summary: Text<'static>,
     pub pipelines: PipelineTable, // widget
     pub pipelines_table_state: TableState,
+    pub selected_pipeline_id: Option<PipelineId>,
     pub popup_area: RefRect,
     pub max_recent_pipelines: usize,
     pub include_mr_pipelines: bool,
@@ -37,12 +39,38 @@ impl ProjectDetailsPopup {
 
 impl ProjectDetailsPopupState {
     pub fn with_project(&self, project: Project) -> Self {
-        Self::new(
+        let prev_selected_idx = self.pipelines_table_state.selected().unwrap_or(0);
+        let prev_pipeline_id = self.selected_pipeline_id.or_else(|| {
+            self.project
+                .recent_pipelines(self.max_recent_pipelines, self.include_mr_pipelines)
+                .get(prev_selected_idx)
+                .map(|p| p.id)
+        });
+
+        let mut next = Self::new(
             project,
             self.popup_area.clone(),
             self.max_recent_pipelines,
             self.include_mr_pipelines,
-        )
+        );
+
+        let new_pipelines = next
+            .project
+            .recent_pipelines(next.max_recent_pipelines, next.include_mr_pipelines);
+
+        let mut table_state = self.pipelines_table_state.clone();
+        if new_pipelines.is_empty() {
+            table_state.select(None);
+            next.selected_pipeline_id = None;
+        } else {
+            let new_idx = prev_pipeline_id
+                .and_then(|id| new_pipelines.iter().position(|p| p.id == id))
+                .unwrap_or_else(|| prev_selected_idx.min(new_pipelines.len() - 1));
+            table_state.select(Some(new_idx));
+            next.selected_pipeline_id = Some(new_pipelines[new_idx].id);
+        }
+        next.pipelines_table_state = table_state;
+        next
     }
 
     pub fn new(
@@ -68,9 +96,10 @@ impl ProjectDetailsPopupState {
             Self::storage_size_line(project.artifacts_size_kb, "in artifacts"),
         ]);
 
-        let pipelines: Vec<&Pipeline> =
+        let recent: Vec<&Pipeline> =
             project.recent_pipelines(max_recent_pipelines, include_mr_pipelines);
-        let pipelines = PipelineTable::new(&pipelines, &project.merge_requests);
+        let selected_pipeline_id = recent.first().map(|p| p.id);
+        let pipelines = PipelineTable::new(&recent, &project.merge_requests);
 
         ProjectDetailsPopupState {
             project,
@@ -78,6 +107,7 @@ impl ProjectDetailsPopupState {
             project_stat_summary,
             pipelines,
             pipelines_table_state: TableState::default().with_selected(0),
+            selected_pipeline_id,
             popup_area,
             max_recent_pipelines,
             include_mr_pipelines,
