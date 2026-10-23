@@ -80,6 +80,12 @@ pub struct GlimConfig {
     /// Enable full-table sweep/fade-in effect on project refresh (default: true)
     #[serde(default = "default_true")]
     pub table_sweep_effect: bool,
+    /// Enable popup open/close animations and background dimming (default: true)
+    #[serde(default = "default_true")]
+    pub popup_effects: bool,
+    /// Enable notification banner scramble/border/pulse animations (default: true)
+    #[serde(default = "default_true")]
+    pub notification_effects: bool,
     /// Maximum number of pipelines (branches/MRs) displayed per project in the main table
     #[serde(default = "default_max_pipelines_per_project")]
     pub max_pipelines_per_project: usize,
@@ -125,6 +131,8 @@ impl Default for GlimConfig {
             animations: true,
             glitch_effect: true,
             table_sweep_effect: true,
+            popup_effects: true,
+            notification_effects: true,
             max_pipelines_per_project: default_max_pipelines_per_project(),
             max_recent_pipelines: default_max_recent_pipelines(),
             max_age_days: None,

@@ -226,6 +226,8 @@ impl ConfigPopupState {
             animations,
             glitch_effect: self.base_config.glitch_effect,
             table_sweep_effect: self.base_config.table_sweep_effect,
+            popup_effects: self.base_config.popup_effects,
+            notification_effects: self.base_config.notification_effects,
             max_pipelines_per_project,
             max_recent_pipelines: self.base_config.max_recent_pipelines,
             max_age_days,

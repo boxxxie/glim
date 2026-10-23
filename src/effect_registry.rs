@@ -107,6 +107,10 @@ pub struct EffectRegistry {
     glitch_effect_enabled: bool,
     /// Whether the table sweep-in effect on project refresh is enabled
     table_sweep_enabled: bool,
+    /// Whether popup open/close effects and background dimming are enabled
+    popup_effects_enabled: bool,
+    /// Whether notification banner scramble/blink effects are enabled
+    notification_effects_enabled: bool,
 }
 
 impl EffectRegistry {
@@ -127,6 +131,8 @@ impl EffectRegistry {
             animations_enabled: true, // default to enabled
             glitch_effect_enabled: true,
             table_sweep_enabled: true,
+            popup_effects_enabled: true,
+            notification_effects_enabled: true,
         }
     }
 
@@ -156,6 +162,8 @@ impl EffectRegistry {
                 self.animations_enabled = config.animations;
                 self.glitch_effect_enabled = config.glitch_effect;
                 self.table_sweep_enabled = config.table_sweep_effect;
+                self.popup_effects_enabled = config.popup_effects;
+                self.notification_effects_enabled = config.notification_effects;
                 self.register_default_glitch_effect();
             },
             _ => (),
@@ -185,13 +193,7 @@ impl EffectRegistry {
     /// * `buf` - Mutable reference to the terminal buffer to render into
     /// * `area` - The screen area to render effects within
     pub fn process_effects(&mut self, duration: Duration, buf: &mut Buffer, area: Rect) {
-        let effective_duration = if self.animations_enabled {
-            duration
-        } else {
-            Duration::from_secs(3600) // 1 hour - ensures all effects complete immediately
-        };
-        self.effects
-            .process_effects(effective_duration, buf, area);
+        self.effects.process_effects(duration, buf, area);
     }
 
     /// Creates a table fade-in effect for the projects table.
@@ -309,6 +311,11 @@ impl EffectRegistry {
     /// * `id` - Unique identifier for the popup effect
     /// * `popup_area` - Reference to the popup's screen area
     fn register_popup(&mut self, id: FxId, popup_area: RefRect) {
+        if !self.animations_enabled || !self.popup_effects_enabled {
+            self.add_unique(id, consume_tick());
+            return;
+        }
+
         let fx = parallel(&[
             dynamic_area(popup_area.clone(), open_window_fx(Dark0)),
             dim_screen_behind_popup(self.screen_area(), popup_area),
@@ -325,6 +332,11 @@ impl EffectRegistry {
     ///
     /// * `id` - Unique identifier for the popup to close
     fn register_close_popup(&mut self, id: FxId) {
+        if !self.animations_enabled || !self.popup_effects_enabled {
+            self.add_unique(id, consume_tick());
+            return;
+        }
+
         let fx = fade_from(Dark3, Dark0Hard, (300, Interpolation::CircIn));
         self.add_unique(id, fx);
     }
@@ -346,6 +358,14 @@ impl EffectRegistry {
     /// 4. Fade out text and redraw border (350ms total)
     /// 5. Dispatch close notification event
     pub fn register_notification_effect(&mut self, content_area: RefRect) {
+        if !self.animations_enabled || !self.notification_effects_enabled {
+            let fx = sequence(&[
+                sleep(Duration::from_millis(5000)),
+                self.dispatch(GlimEvent::NotificationDismiss),
+            ]);
+            self.add_unique(FxId::Notification, fx);
+            return;
+        }
         use tachyonfx::Interpolation::{SineIn, SineOut};
 
         use crate::gruvbox::Gruvbox::Dark0Hard;
