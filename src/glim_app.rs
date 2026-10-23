@@ -249,6 +249,9 @@ impl GlimApp {
                 info!(project_id = %project_id, job_id = %job_id, trace_length = trace.len(), "Job log downloaded and copied to clipboard");
                 self.clipboard.set_text(trace).unwrap();
             },
+            GlimEvent::CopyToClipboard(text) => {
+                let _ = self.clipboard.set_text(text.to_string());
+            },
 
             GlimEvent::JobsActiveFetch => {
                 debug!("Requesting active jobs for all projects");
@@ -440,6 +443,10 @@ impl GlimApp {
 
     pub fn recent_activity(&self) -> &[crate::domain::ProjectActivityEvent] {
         self.project_store.recent_activity()
+    }
+
+    pub fn activity_event(&self, id: u64) -> Option<&crate::domain::ProjectActivityEvent> {
+        self.project_store.find_activity(id)
     }
 
     pub fn filtered_projects(

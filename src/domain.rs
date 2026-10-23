@@ -142,6 +142,7 @@ pub struct ProjectActivityEvent {
     pub branch: Option<CompactString>,
     pub summary: CompactString,
     pub detail: Option<CompactString>,
+    pub body: Option<CompactString>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -400,7 +401,32 @@ pub fn contains_mention(text: &str, username: &str) -> bool {
     false
 }
 
-/// Strip HTML tags, comments, and collapse whitespace for clean 1-line comment previews.
+/// Strip HTML tags while preserving line/paragraph breaks for multi-line inspection popups.
+pub fn clean_multiline_body(raw: &str) -> CompactString {
+    let with_breaks = raw
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n")
+        .replace("</li>", "\n")
+        .replace("</div>", "\n");
+    let mut out = String::with_capacity(with_breaks.len());
+    let mut in_tag = false;
+    for ch in with_breaks.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {},
+        }
+    }
+    let lines: Vec<String> = out
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.join("\n").into()
+}
 pub fn clean_note_body(raw: &str, max_chars: usize) -> CompactString {
     let mut out = String::with_capacity(raw.len().min(max_chars + 16));
     let mut in_tag = false;

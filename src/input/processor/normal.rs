@@ -18,8 +18,13 @@ impl NormalModeProcessor {
         Self { sender, selected: None }
     }
 
-    fn process(&self, event: &KeyEvent) {
+    fn process(&self, event: &KeyEvent, ui: &StatefulWidgets) {
+        let feed_focused = ui.activity_feed_focused && ui.show_activity_feed;
         if let Some(e) = match event.code {
+            KeyCode::Tab | KeyCode::BackTab => Some(GlimEvent::FocusToggle),
+            KeyCode::Enter | KeyCode::Char('o') if feed_focused => {
+                ui.selected_activity_id.map(GlimEvent::ActivityDetailsOpen)
+            },
             KeyCode::Enter if self.selected.is_some() => {
                 Some(GlimEvent::ProjectDetailsOpen(self.selected.unwrap()))
             },
@@ -36,10 +41,10 @@ impl NormalModeProcessor {
             KeyCode::Char('r') => Some(GlimEvent::ProjectsFetch),
             KeyCode::Char('w') => self.selected.map(GlimEvent::ProjectOpenUrl),
             KeyCode::F(12) => Some(GlimEvent::ScreenCapture),
-            KeyCode::Up => Some(GlimEvent::ProjectPrevious),
-            KeyCode::Down => Some(GlimEvent::ProjectNext),
-            KeyCode::Char('k') => Some(GlimEvent::ProjectPrevious),
-            KeyCode::Char('j') => Some(GlimEvent::ProjectNext),
+            KeyCode::Up | KeyCode::Char('k') if feed_focused => Some(GlimEvent::ActivityPrevious),
+            KeyCode::Down | KeyCode::Char('j') if feed_focused => Some(GlimEvent::ActivityNext),
+            KeyCode::Up | KeyCode::Char('k') => Some(GlimEvent::ProjectPrevious),
+            KeyCode::Down | KeyCode::Char('j') => Some(GlimEvent::ProjectNext),
             KeyCode::Esc => Some(GlimEvent::FilterClear),
             _ => None,
         } {
@@ -77,7 +82,7 @@ impl InputProcessor for NormalModeProcessor {
                 if ui.filter_input_active {
                     self.process_filter_input(e, ui);
                 } else {
-                    self.process(e);
+                    self.process(e, ui);
                 }
             },
             _ => (),

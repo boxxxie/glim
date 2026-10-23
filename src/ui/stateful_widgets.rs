@@ -16,7 +16,10 @@ use crate::{
     glim_app::{GlimApp, GlimConfig, Modulo},
     id::{PipelineId, ProjectId},
     ui::{
-        popup::{ConfigPopupState, PipelineActionsPopupState, ProjectDetailsPopupState},
+        popup::{
+            ActivityDetailsPopupState, ConfigPopupState, PipelineActionsPopupState,
+            ProjectDetailsPopupState,
+        },
         widget::NotificationState,
     },
 };
@@ -31,6 +34,11 @@ pub enum ClickAction {
     SelectPipelineAndDispatch {
         table_row: usize,
         pipeline_id: PipelineId,
+        event: GlimEvent,
+    },
+    SelectActivityAndDispatch {
+        index: usize,
+        activity_id: u64,
         event: GlimEvent,
     },
     Dispatch(Vec<GlimEvent>),
@@ -50,12 +58,16 @@ pub struct StatefulWidgets {
     pub config_popup_state: Option<ConfigPopupState>,
     pub project_details: Option<ProjectDetailsPopupState>,
     pub pipeline_actions: Option<PipelineActionsPopupState>,
+    pub activity_details: Option<ActivityDetailsPopupState>,
     pub notice: Option<NotificationState>,
     pub filter_input_active: bool,
     pub filter_input_text: CompactString,
     pub temporary_filter: Option<CompactString>,
     pub capture_screen_requested: bool,
     pub show_activity_feed: bool,
+    pub activity_feed_focused: bool,
+    pub activity_selected_index: Option<usize>,
+    pub selected_activity_id: Option<u64>,
     pub activity_feed_scroll: usize,
     pub last_feed_area: Option<Rect>,
     pub click_regions: Vec<ClickRegion>,
@@ -72,12 +84,16 @@ impl StatefulWidgets {
             config_popup_state: None,
             project_details: None,
             pipeline_actions: None,
+            activity_details: None,
             notice: None,
             filter_input_active: false,
             filter_input_text: CompactString::default(),
             temporary_filter: None,
             capture_screen_requested: false,
             show_activity_feed: true,
+            activity_feed_focused: false,
+            activity_selected_index: Some(0),
+            selected_activity_id: None,
             activity_feed_scroll: 0,
             last_feed_area: None,
             click_regions: Vec::new(),
@@ -90,6 +106,29 @@ impl StatefulWidgets {
             GlimEvent::InputMouse(mouse) => self.handle_mouse_event(*mouse, app),
             GlimEvent::ProjectNext => self.handle_project_selection(1, app),
             GlimEvent::ProjectPrevious => self.handle_project_selection(-1, app),
+            GlimEvent::ActivityNext => self.handle_activity_selection(1, app),
+            GlimEvent::ActivityPrevious => self.handle_activity_selection(-1, app),
+            GlimEvent::FocusToggle => {
+                if self.show_activity_feed {
+                    self.activity_feed_focused = !self.activity_feed_focused;
+                    if self.activity_feed_focused && self.selected_activity_id.is_none() {
+                        if let Some(first) = app.recent_activity().first() {
+                            self.activity_selected_index = Some(0);
+                            self.selected_activity_id = Some(first.id);
+                        }
+                    }
+                } else {
+                    self.activity_feed_focused = false;
+                }
+            },
+            GlimEvent::ActivityDetailsOpen(id) => {
+                if let Some(ev) = app.activity_event(*id).cloned() {
+                    let popup_area = RefRect::default();
+                    effects.register_project_details(popup_area.clone());
+                    self.activity_details = Some(ActivityDetailsPopupState::new(ev, popup_area));
+                }
+            },
+            GlimEvent::ActivityDetailsClose => self.activity_details = None,
             GlimEvent::ProjectsLoaded(_) => {
                 let exclude_area_from_fx = self.current_popup_area();
                 effects.register_projects_table_new_data(exclude_area_from_fx)
@@ -129,7 +168,12 @@ impl StatefulWidgets {
             GlimEvent::FilterInputBackspace => self.remove_filter_char(),
             GlimEvent::FilterClear => self.clear_filter(),
             GlimEvent::ApplyTemporaryFilter(filter) => self.apply_temporary_filter(filter.clone()),
-            GlimEvent::ToggleActivityFeed => self.show_activity_feed = !self.show_activity_feed,
+            GlimEvent::ToggleActivityFeed => {
+                self.show_activity_feed = !self.show_activity_feed;
+                if !self.show_activity_feed {
+                    self.activity_feed_focused = false;
+                }
+            },
 
             _ => (),
         }
@@ -138,6 +182,8 @@ impl StatefulWidgets {
     fn current_popup_area(&self) -> Option<RefRect> {
         if let Some(pd) = &self.project_details {
             Some(pd.popup_area.clone())
+        } else if let Some(ad) = &self.activity_details {
+            Some(ad.popup_area.clone())
         } else if let Some(cp) = &self.config_popup_state {
             Some(cp.popup_area.clone())
         } else {
@@ -303,6 +349,44 @@ impl StatefulWidgets {
         }
     }
 
+    pub fn handle_activity_selection(&mut self, direction: i32, app: &GlimApp) {
+        let events = app.recent_activity();
+        if events.is_empty() {
+            self.activity_selected_index = None;
+            self.selected_activity_id = None;
+            return;
+        }
+
+        let current = self.activity_selected_index.unwrap_or(0);
+        let new_index = match direction {
+            1 => current.saturating_add(1),
+            -1 => current.saturating_sub(1),
+            _ => current,
+        }
+        .min(events.len().saturating_sub(1));
+
+        self.activity_selected_index = Some(new_index);
+        self.selected_activity_id = Some(events[new_index].id);
+
+        if let Some(feed_rect) = self.last_feed_area {
+            let visible_rows = feed_rect.height.saturating_sub(2).max(1) as usize;
+            if new_index < self.activity_feed_scroll {
+                self.activity_feed_scroll = new_index;
+            } else if new_index >= self.activity_feed_scroll + visible_rows {
+                self.activity_feed_scroll = new_index + 1 - visible_rows;
+            }
+        }
+    }
+
+    pub fn handle_activity_action_selection(&mut self, direction: i32) {
+        if let Some(ad) = self.activity_details.as_mut() {
+            if let Some(current) = ad.list_state.selected() {
+                let new_index = (current as i32 + direction).modulo(ad.actions.len() as i32);
+                ad.list_state.select(Some(new_index as usize));
+            }
+        }
+    }
+
     fn show_filter_input(&mut self) {
         self.filter_input_active = true;
         // Start with the current temporary filter or empty string
@@ -374,27 +458,40 @@ impl StatefulWidgets {
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self.pipeline_actions.is_some() {
+                if self.activity_details.is_some() {
+                    self.handle_activity_action_selection(-1);
+                } else if self.pipeline_actions.is_some() {
                     self.handle_pipeline_action_selection(-1);
                 } else if self.project_details.is_some() {
                     self.handle_pipeline_selection(-1);
                 } else if self.config_popup_state.is_none() {
                     if self.last_feed_area.is_some_and(|r| r.contains(pos)) {
-                        self.activity_feed_scroll = self.activity_feed_scroll.saturating_sub(1);
+                        if self.activity_feed_focused {
+                            self.handle_activity_selection(-1, app);
+                        } else {
+                            self.activity_feed_scroll = self.activity_feed_scroll.saturating_sub(1);
+                        }
                     } else {
                         self.handle_project_selection(-1, app);
                     }
                 }
             },
             MouseEventKind::ScrollDown => {
-                if self.pipeline_actions.is_some() {
+                if self.activity_details.is_some() {
+                    self.handle_activity_action_selection(1);
+                } else if self.pipeline_actions.is_some() {
                     self.handle_pipeline_action_selection(1);
                 } else if self.project_details.is_some() {
                     self.handle_pipeline_selection(1);
                 } else if self.config_popup_state.is_none() {
                     if self.last_feed_area.is_some_and(|r| r.contains(pos)) {
-                        let max_scroll = app.recent_activity().len().saturating_sub(1);
-                        self.activity_feed_scroll = (self.activity_feed_scroll + 1).min(max_scroll);
+                        if self.activity_feed_focused {
+                            self.handle_activity_selection(1, app);
+                        } else {
+                            let max_scroll = app.recent_activity().len().saturating_sub(1);
+                            self.activity_feed_scroll =
+                                (self.activity_feed_scroll + 1).min(max_scroll);
+                        }
                     } else {
                         self.handle_project_selection(1, app);
                     }
@@ -414,12 +511,23 @@ impl StatefulWidgets {
                             project_id,
                             event,
                         } => {
+                            self.activity_feed_focused = false;
                             self.project_table_state.select(Some(table_row));
                             self.selected_project_id = Some(project_id);
                             self.sender.dispatch(GlimEvent::ProjectSelected(project_id));
                             if let Some(ev) = event {
                                 self.sender.dispatch(ev);
                             }
+                        },
+                        ClickAction::SelectActivityAndDispatch {
+                            index,
+                            activity_id,
+                            event,
+                        } => {
+                            self.activity_feed_focused = true;
+                            self.activity_selected_index = Some(index);
+                            self.selected_activity_id = Some(activity_id);
+                            self.sender.dispatch(event);
                         },
                         ClickAction::SelectPipelineAndDispatch {
                             table_row,

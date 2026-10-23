@@ -17,6 +17,7 @@ pub struct ProjectsTable<'a> {
     rows: Vec<Row<'a>>,
     filter_active: bool,
     filter_text: &'a str,
+    focused: bool,
 }
 
 impl<'a> ProjectsTable<'a> {
@@ -26,6 +27,7 @@ impl<'a> ProjectsTable<'a> {
         filter_text: &'a str,
         max_pipelines_per_project: usize,
         include_mr_pipelines: bool,
+        focused: bool,
     ) -> Self {
         Self {
             rows: projects
@@ -36,6 +38,7 @@ impl<'a> ProjectsTable<'a> {
                 .collect(),
             filter_active,
             filter_text,
+            focused,
         }
     }
 }
@@ -51,6 +54,7 @@ impl StatefulWidget for ProjectsTable<'_> {
         } else {
             Shortcuts::from(vec![
                 ("q", "quit"),
+                ("tab", "switch pane"),
                 ("w", "open web"),
                 ("c", "config"),
                 ("m", "mr activity"),
@@ -94,9 +98,10 @@ impl StatefulWidget for ProjectsTable<'_> {
             .render(table_area, buf);
 
         let content_area = table_area.inner(Margin::new(2, 1));
-        let table = Table::new(self.rows, PROJECT_COLUMN_CONSTRAINTS)
-            .row_highlight_style(theme().highlight_symbol)
-            .column_spacing(1);
+        let mut table = Table::new(self.rows, PROJECT_COLUMN_CONSTRAINTS).column_spacing(1);
+        if self.focused {
+            table = table.row_highlight_style(theme().highlight_symbol);
+        }
 
         StatefulWidget::render(table, content_area, buf, state);
 

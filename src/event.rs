@@ -25,7 +25,11 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum GlimEvent {
+    ActivityDetailsClose,
+    ActivityDetailsOpen(u64),
+    ActivityNext,
     ActivityNotice(CompactString),
+    ActivityPrevious,
     AppError(result::GlimError),
     AppExit,
     AppTick,
@@ -34,12 +38,14 @@ pub enum GlimEvent {
     ConfigClose,
     ConfigOpen,
     ConfigUpdate(GlimConfig),
+    CopyToClipboard(CompactString),
     CurrentUserLoaded(CompactString),
     FilterClear,
     FilterInputBackspace,
     FilterInputChar(CompactString),
     FilterMenuClose,
     FilterMenuShow,
+    FocusToggle,
     #[allow(dead_code)]
     GlitchOverride(GlitchState),
     InputKey(KeyEvent),
@@ -86,7 +92,11 @@ impl GlimEvent {
     /// Get the variant name as a string slice (without "GlimEvent::" prefix)
     pub fn variant_name(&self) -> &'static str {
         match self {
+            GlimEvent::ActivityDetailsClose => "ActivityDetailsClose",
+            GlimEvent::ActivityDetailsOpen(_) => "ActivityDetailsOpen",
+            GlimEvent::ActivityNext => "ActivityNext",
             GlimEvent::ActivityNotice(_) => "ActivityNotice",
+            GlimEvent::ActivityPrevious => "ActivityPrevious",
             GlimEvent::AppError(_) => "AppError",
             GlimEvent::AppExit => "AppExit",
             GlimEvent::AppTick => "AppTick",
@@ -95,12 +105,14 @@ impl GlimEvent {
             GlimEvent::ConfigClose => "ConfigClose",
             GlimEvent::ConfigOpen => "ConfigOpen",
             GlimEvent::ConfigUpdate(_) => "ConfigUpdate",
+            GlimEvent::CopyToClipboard(_) => "CopyToClipboard",
             GlimEvent::CurrentUserLoaded(_) => "CurrentUserLoaded",
             GlimEvent::FilterClear => "FilterClear",
             GlimEvent::FilterInputBackspace => "FilterInputBackspace",
             GlimEvent::FilterInputChar(_) => "FilterInputChar",
             GlimEvent::FilterMenuClose => "FilterMenuClose",
             GlimEvent::FilterMenuShow => "FilterMenuShow",
+            GlimEvent::FocusToggle => "FocusToggle",
             GlimEvent::GlitchOverride(_) => "GlitchOverride",
             GlimEvent::InputKey(_) => "InputKey",
             GlimEvent::InputMouse(_) => "InputMouse",

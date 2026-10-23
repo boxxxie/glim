@@ -11,8 +11,8 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     dispatcher::Dispatcher,
     domain::{
-        clean_note_body, contains_mention, ActivityKind, GitlabEventDto, GitlabTodoDto, Job,
-        MergeRequest, Pipeline, PipelineStatus, Project, ProjectActivityEvent,
+        clean_multiline_body, clean_note_body, contains_mention, ActivityKind, GitlabEventDto,
+        GitlabTodoDto, Job, MergeRequest, Pipeline, PipelineStatus, Project, ProjectActivityEvent,
     },
     event::GlimEvent,
     glim_app::GlimConfig,
@@ -70,6 +70,10 @@ impl ProjectStore {
 
     pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
         &self.recent_activity
+    }
+
+    pub fn find_activity(&self, id: u64) -> Option<&ProjectActivityEvent> {
+        self.recent_activity.iter().find(|e| e.id == id)
     }
 
     pub fn notify_latest_activity(&self) {
@@ -239,7 +243,7 @@ impl ProjectStore {
                                             _ => None,
                                         };
                                         if let Some((sum, body, urg, label)) = transition {
-                                            notifications.push((sum, body, urg));
+                                            notifications.push((sum.clone(), body.clone(), urg));
                                             pipeline_feed_events.push(ProjectActivityEvent {
                                                 id: p.id.value().wrapping_mul(1000)
                                                     + (p.updated_at.timestamp() as u64 % 1000),
@@ -252,6 +256,7 @@ impl ProjectStore {
                                                 summary: format!("Pipeline #{} {}", p.id, label)
                                                     .into(),
                                                 detail: None,
+                                                body: Some(format!("{sum}\nBranch: {body}\nURL: {}", p.url).into()),
                                                 created_at: p.updated_at,
                                             });
                                         }
@@ -279,7 +284,7 @@ impl ProjectStore {
                                         _ => None,
                                     };
                                     if let Some((sum, body, urg, label)) = transition {
-                                        notifications.push((sum, body, urg));
+                                        notifications.push((sum.clone(), body.clone(), urg));
                                         pipeline_feed_events.push(ProjectActivityEvent {
                                             id: p.id.value().wrapping_mul(1000)
                                                 + (p.updated_at.timestamp() as u64 % 1000),
@@ -291,6 +296,7 @@ impl ProjectStore {
                                             branch: Some(p.branch.clone()),
                                             summary: format!("Pipeline #{} {}", p.id, label).into(),
                                             detail: None,
+                                            body: Some(format!("{sum}\nBranch: {body}\nURL: {}", p.url).into()),
                                             created_at: p.updated_at,
                                         });
                                     }
@@ -622,12 +628,13 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title,
+                summary: title.clone(),
                 detail: if action == "reopened" {
                     Some("reopened".into())
                 } else {
                     None
                 },
+                body: Some(title),
                 created_at: dto.created_at,
             })
         },
@@ -642,8 +649,9 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title,
+                summary: title.clone(),
                 detail: None,
+                body: Some(title),
                 created_at: dto.created_at,
             })
         },
@@ -658,8 +666,9 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title,
+                summary: title.clone(),
                 detail: None,
+                body: Some(title),
                 created_at: dto.created_at,
             })
         },
@@ -674,8 +683,9 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title,
+                summary: title.clone(),
                 detail: None,
+                body: Some(title),
                 created_at: dto.created_at,
             })
         },
@@ -696,6 +706,7 @@ pub fn convert_gitlab_event(
             if snippet.is_empty() {
                 return None;
             }
+            let full_body = clean_multiline_body(&note.body);
             let detail = dto.target_title.clone().filter(|t| t != &snippet);
             let kind = if is_mention {
                 ActivityKind::Mention
@@ -712,6 +723,7 @@ pub fn convert_gitlab_event(
                 branch: None,
                 summary: snippet,
                 detail,
+                body: Some(full_body),
                 created_at: dto.created_at,
             })
         },
@@ -736,12 +748,13 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: Some(branch),
-                summary: commit_title,
+                summary: commit_title.clone(),
                 detail: if push.commit_count > 1 {
                     Some(format!("{} commits", push.commit_count).into())
                 } else {
                     None
                 },
+                body: Some(commit_title),
                 created_at: dto.created_at,
             })
         },
@@ -756,10 +769,11 @@ pub fn convert_gitlab_event(
                     author,
                     mr_iid: None,
                     branch: None,
-                    summary: title,
+                    summary: title.clone(),
                     detail: dto
                         .target_iid
                         .map(|iid| format!("{target_type} #{iid}").into()),
+                    body: Some(title),
                     created_at: dto.created_at,
                 })
             } else {
@@ -799,6 +813,7 @@ pub fn convert_gitlab_todo(
     };
     let target_title = todo.target.as_ref().and_then(|t| t.title.clone());
     let snippet = clean_note_body(&todo.body, 90);
+    let full_body = clean_multiline_body(&todo.body);
     let summary = if !snippet.is_empty() {
         snippet
     } else {
@@ -815,8 +830,9 @@ pub fn convert_gitlab_todo(
         author: todo.author.username.clone(),
         mr_iid,
         branch: None,
-        summary,
+        summary: summary.clone(),
         detail,
+        body: Some(if !full_body.is_empty() { full_body } else { summary }),
         created_at: todo.created_at,
     })
 }

@@ -14,7 +14,7 @@ use crate::{
     glim_app::GlimApp,
     theme::theme,
     ui::{
-        popup::{ConfigPopup, PipelineActionsPopup, ProjectDetailsPopup},
+        popup::{ActivityDetailsPopup, ConfigPopup, PipelineActionsPopup, ProjectDetailsPopup},
         widget::{ActivityFeed, Notification, ProjectsTable},
         ClickAction, ClickRegion, StatefulWidgets,
     },
@@ -119,6 +119,7 @@ fn render_projects_table(
         &widget_states.filter_input_text,
         config.max_pipelines_per_project,
         config.include_mr_pipelines,
+        !widget_states.activity_feed_focused,
     );
     f.render_stateful_widget(
         projects,
@@ -127,8 +128,41 @@ fn render_projects_table(
     );
 
     if let Some(feed_area) = feed_area {
-        let activity =
-            ActivityFeed::new(app.recent_activity(), widget_states.activity_feed_scroll);
+        let events = app.recent_activity();
+        if events.is_empty() {
+            widget_states.activity_selected_index = None;
+            widget_states.selected_activity_id = None;
+        } else if let Some(sel_id) = widget_states.selected_activity_id {
+            if let Some(idx) = events.iter().position(|e| e.id == sel_id) {
+                widget_states.activity_selected_index = Some(idx);
+            } else {
+                let clamped = widget_states
+                    .activity_selected_index
+                    .unwrap_or(0)
+                    .min(events.len() - 1);
+                widget_states.activity_selected_index = Some(clamped);
+                widget_states.selected_activity_id = Some(events[clamped].id);
+            }
+        } else if widget_states.activity_feed_focused {
+            widget_states.activity_selected_index = Some(0);
+            widget_states.selected_activity_id = Some(events[0].id);
+        }
+
+        if let Some(sel_idx) = widget_states.activity_selected_index {
+            let visible_rows = feed_area.height.saturating_sub(2).max(1) as usize;
+            if sel_idx < widget_states.activity_feed_scroll {
+                widget_states.activity_feed_scroll = sel_idx;
+            } else if sel_idx >= widget_states.activity_feed_scroll + visible_rows {
+                widget_states.activity_feed_scroll = sel_idx + 1 - visible_rows;
+            }
+        }
+
+        let activity = ActivityFeed::new(
+            events,
+            widget_states.activity_feed_scroll,
+            widget_states.activity_feed_focused,
+            widget_states.activity_selected_index,
+        );
         f.render_widget(activity, feed_area);
     }
 
@@ -156,6 +190,11 @@ fn render_popups(
     if let Some(pipeline_actions) = widget_states.pipeline_actions.as_mut() {
         let popup = PipelineActionsPopup::new();
         f.render_stateful_widget(popup, area, pipeline_actions);
+    }
+
+    if let Some(activity_details) = widget_states.activity_details.as_mut() {
+        let popup = ActivityDetailsPopup::new();
+        f.render_stateful_widget(popup, area, activity_details);
     }
 
     if let Some(config_popup) = &mut widget_states.config_popup_state {
@@ -243,22 +282,22 @@ fn update_main_click_regions(
 
     if let Some(feed_rect) = feed_area {
         let feed_inner = feed_rect.inner(Margin::new(2, 1));
-        for (idx, ev) in app
+        for (vis_idx, (abs_idx, ev)) in app
             .recent_activity()
             .iter()
+            .enumerate()
             .skip(widget_states.activity_feed_scroll)
             .take(feed_inner.height as usize)
             .enumerate()
         {
-            let line_y = feed_inner.y + idx as u16;
-            let event = if let Some(iid) = ev.mr_iid {
-                GlimEvent::MergeRequestOpenUrl(ev.project_id, iid)
-            } else {
-                GlimEvent::ProjectOpenUrl(ev.project_id)
-            };
+            let line_y = feed_inner.y + vis_idx as u16;
             widget_states.click_regions.push(ClickRegion {
                 area: Rect::new(feed_inner.x, line_y, feed_inner.width, 1),
-                action: ClickAction::Dispatch(vec![event]),
+                action: ClickAction::SelectActivityAndDispatch {
+                    index: abs_idx,
+                    activity_id: ev.id,
+                    event: GlimEvent::ActivityDetailsOpen(ev.id),
+                },
             });
         }
     }
@@ -267,6 +306,35 @@ fn update_main_click_regions(
 fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
     if widget_states.config_popup_state.is_some() {
         widget_states.click_regions.clear();
+        return;
+    }
+
+    if let Some(ad) = &widget_states.activity_details {
+        widget_states.click_regions.clear();
+        let popup_rect = ad.popup_area.get();
+        let content_area = popup_rect.inner(Margin::new(2, 1));
+        let actions_h = ad.actions.len() as u16;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(actions_h),
+            ])
+            .split(content_area);
+        let actions_area = chunks[2];
+        for (idx, (_, action)) in ad.actions.iter().enumerate() {
+            let row_y = actions_area.y + idx as u16;
+            if row_y < actions_area.bottom() {
+                widget_states.click_regions.push(ClickRegion {
+                    area: Rect::new(actions_area.x, row_y, actions_area.width, 1),
+                    action: ClickAction::Dispatch(vec![
+                        GlimEvent::ActivityDetailsClose,
+                        action.clone(),
+                    ]),
+                });
+            }
+        }
         return;
     }
 

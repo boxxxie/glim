@@ -1,8 +1,10 @@
+mod activity_details;
 mod config;
 mod normal;
 mod pipeline_actions;
 mod project_details;
 
+pub use activity_details::*;
 pub use config::*;
 pub use normal::*;
 pub use pipeline_actions::*;

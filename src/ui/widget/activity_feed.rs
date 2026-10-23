@@ -9,16 +9,29 @@ use ratatui::{
 use crate::{
     domain::{ActivityKind, ProjectActivityEvent},
     theme::theme,
+    ui::widget::Shortcuts,
 };
 
 pub struct ActivityFeed<'a> {
     events: &'a [ProjectActivityEvent],
     scroll_offset: usize,
+    focused: bool,
+    selected_index: Option<usize>,
 }
 
 impl<'a> ActivityFeed<'a> {
-    pub fn new(events: &'a [ProjectActivityEvent], scroll_offset: usize) -> Self {
-        Self { events, scroll_offset }
+    pub fn new(
+        events: &'a [ProjectActivityEvent],
+        scroll_offset: usize,
+        focused: bool,
+        selected_index: Option<usize>,
+    ) -> Self {
+        Self {
+            events,
+            scroll_offset,
+            focused,
+            selected_index,
+        }
     }
 }
 
@@ -36,14 +49,26 @@ impl Widget for ActivityFeed<'_> {
             " mr & repo activity ".to_string()
         };
 
-        Block::new()
+        let shortcuts = Shortcuts::from(vec![
+            ("tab", "switch pane"),
+            ("↑↓", "selection"),
+            ("↵", "inspect event"),
+            ("click", "inspect"),
+            ("m", "hide"),
+        ]);
+
+        let mut block = Block::new()
             .title(title)
             .title_style(theme().border_title)
             .borders(Borders::ALL)
             .border_style(theme().table_border)
             .style(theme().background)
-            .border_type(BorderType::Plain)
-            .render(area, buf);
+            .border_type(BorderType::Plain);
+
+        if self.focused {
+            block = block.title_bottom(shortcuts.as_line());
+        }
+        block.render(area, buf);
 
         let content_area = area.inner(Margin::new(2, 1));
         let max_lines = content_area.height as usize;
@@ -60,9 +85,10 @@ impl Widget for ActivityFeed<'_> {
         let lines: Vec<Line<'_>> = self
             .events
             .iter()
+            .enumerate()
             .skip(self.scroll_offset)
             .take(max_lines)
-            .map(|ev| {
+            .map(|(abs_idx, ev)| {
                 let local_ts = ev.created_at.with_timezone(&Local);
                 let mut spans = crate::ui::format_timestamp_spans(local_ts);
                 let action_style = match ev.kind {
@@ -100,10 +126,26 @@ impl Widget for ActivityFeed<'_> {
                     }
                 }
 
-                Line::from(spans)
+                let mut line = Line::from(spans).style(theme().table_row(abs_idx));
+                if self.focused && self.selected_index == Some(abs_idx) {
+                    line = line.style(theme().highlight_symbol);
+                }
+                line
             })
             .collect();
 
         Paragraph::new(Text::from(lines)).render(content_area, buf);
+
+        if self.focused {
+            if let Some(sel_idx) = self.selected_index {
+                if sel_idx >= self.scroll_offset && sel_idx < self.scroll_offset + max_lines {
+                    let row_y = content_area.y + (sel_idx - self.scroll_offset) as u16;
+                    buf.set_style(
+                        Rect::new(content_area.x, row_y, content_area.width, 1),
+                        theme().highlight_symbol,
+                    );
+                }
+            }
+        }
     }
 }
