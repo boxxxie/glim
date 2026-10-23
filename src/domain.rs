@@ -766,41 +766,38 @@ pub fn parse_row<'a>(
         let branch = p.branch.as_str();
 
         let updated_at = p.updated_at.with_timezone(&Local);
-        let mut spans = match () {
-            _ if p.has_active_jobs() => vec![
-                Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
-                Span::from(" "),
-                Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
-                Span::from(" "),
-                Span::from(p.jobs.as_ref().unwrap().icon()),
-                Span::from(" "),
-                Span::from(branch).style(theme().pipeline_branch),
-                Span::from(" "),
-                Span::from(p.active_job_name()).style(theme().pipeline_job),
-                Span::from(" "),
-                Span::from(format_duration(p.duration())).style(theme().time),
-            ],
-            _ if p.status.is_active() => vec![
-                Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
-                Span::from(" "),
-                Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
-                Span::from(" "),
-                Span::from(icon),
-                Span::from(" "),
-                Span::from(branch).style(theme().pipeline_branch),
-                Span::from(" "),
-                Span::from(format_duration(p.duration())).style(theme().time),
-            ],
-            _ => vec![
-                Span::from(updated_at.format("%a, %d %b").to_compact_string()).style(theme().date),
-                Span::from(" "),
-                Span::from(updated_at.format("%H:%M:%S").to_compact_string()).style(theme().time),
-                Span::from(" "),
-                Span::from(icon),
-                Span::from(" "),
-                Span::from(branch).style(theme().pipeline_branch),
-            ],
-        };
+        let mut spans = crate::ui::format_timestamp_spans(updated_at);
+        spans.push(Span::from(" "));
+
+        match () {
+            _ if p.has_active_jobs() => {
+                spans.extend([
+                    Span::from(p.jobs.as_ref().unwrap().icon()),
+                    Span::from(" "),
+                    Span::from(branch).style(theme().pipeline_branch),
+                    Span::from(" "),
+                    Span::from(p.active_job_name()).style(theme().pipeline_job),
+                    Span::from(" "),
+                    Span::from(format_duration(p.duration())).style(theme().time),
+                ]);
+            },
+            _ if p.status.is_active() => {
+                spans.extend([
+                    Span::from(icon),
+                    Span::from(" "),
+                    Span::from(branch).style(theme().pipeline_branch),
+                    Span::from(" "),
+                    Span::from(format_duration(p.duration())).style(theme().time),
+                ]);
+            },
+            _ => {
+                spans.extend([
+                    Span::from(icon),
+                    Span::from(" "),
+                    Span::from(branch).style(theme().pipeline_branch),
+                ]);
+            },
+        }
 
         if let Some(mr) = project.merge_request_for_branch(branch) {
             append_mr_spans(&mut spans, mr, &project.default_branch);
@@ -826,15 +823,9 @@ pub fn parse_row<'a>(
                 .any(|p| p.branch == mr.source_branch);
             if !already_shown {
                 let updated_at = mr.updated_at.with_timezone(&Local);
-                let mut spans = vec![
-                    Span::from(updated_at.format("%a, %d %b").to_compact_string())
-                        .style(theme().date),
-                    Span::from(" "),
-                    Span::from(updated_at.format("%H:%M:%S").to_compact_string())
-                        .style(theme().time),
-                    Span::from(" 🟣 "),
-                    Span::from(mr.source_branch.as_str()).style(theme().pipeline_branch),
-                ];
+                let mut spans = crate::ui::format_timestamp_spans(updated_at);
+                spans.push(Span::from(" 🟣 "));
+                spans.push(Span::from(mr.source_branch.as_str()).style(theme().pipeline_branch));
                 append_mr_spans(&mut spans, mr, &project.default_branch);
                 pipeline_spans.push(Line::from(spans));
             }

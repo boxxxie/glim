@@ -1,5 +1,4 @@
 use chrono::Local;
-use compact_str::ToCompactString;
 use ratatui::{
     buffer::Buffer,
     layout::{Margin, Rect},
@@ -62,9 +61,8 @@ impl Widget for ActivityFeed<'_> {
             .take(max_lines)
             .map(|ev| {
                 let local_ts = ev.created_at.with_timezone(&Local);
-                let mut spans = vec![
-                    Span::from(local_ts.format("%d %b ").to_compact_string()).style(theme().date),
-                    Span::from(local_ts.format("%H:%M:%S").to_compact_string()).style(theme().time),
+                let mut spans = crate::ui::format_timestamp_spans(local_ts);
+                spans.extend([
                     Span::from(" "),
                     Span::from(ev.kind.icon()),
                     Span::from(" "),
@@ -73,7 +71,7 @@ impl Widget for ActivityFeed<'_> {
                     Span::from(format!("@{}", ev.author)).style(theme().activity_author),
                     Span::from(" "),
                     Span::from(ev.kind.action_label()).style(theme().activity_action),
-                ];
+                ]);
 
                 if let Some(mr_iid) = ev.mr_iid {
                     spans.push(Span::from(format!(" !{mr_iid}")).style(theme().mr_iid));

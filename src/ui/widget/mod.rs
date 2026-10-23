@@ -17,8 +17,15 @@ pub use shortcuts::*;
 use crate::theme::theme;
 
 pub fn text_from(date: DateTime<Local>) -> Text<'static> {
-    Text::from(vec![
-        Line::from(date.format("%a, %d %b").to_string()).style(theme().date),
-        Line::from(date.format("%H:%M:%S").to_string()).style(theme().time),
-    ])
+    if let Some(rel) = crate::ui::format_relative_24h(date, Local::now()) {
+        Text::from(vec![
+            Line::from(rel.to_string()).style(theme().time),
+            Line::from(date.format("%H:%M:%S").to_string()).style(theme().date),
+        ])
+    } else {
+        Text::from(vec![
+            Line::from(date.format("%a, %d %b").to_string()).style(theme().date),
+            Line::from(date.format("%H:%M:%S").to_string()).style(theme().time),
+        ])
+    }
 }
