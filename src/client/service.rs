@@ -356,6 +356,61 @@ impl GitlabService {
         });
     }
 
+    /// Fetch a specific historical page of project events (100 per page)
+    #[instrument(skip(self), fields(project_id = %project_id, page = %page))]
+    pub async fn fetch_project_events_page(
+        &self,
+        project_id: ProjectId,
+        page: u32,
+    ) -> Result<()> {
+        if !self.api.is_configured() {
+            return Ok(());
+        }
+
+        match self.api.get_project_events_page(project_id, page).await {
+            Ok(events) => {
+                debug!(
+                    event_count = events.len(),
+                    project_id = %project_id,
+                    page = %page,
+                    "Successfully fetched historical project events page"
+                );
+                self.sender.dispatch(GlimEvent::ProjectEventsPageLoaded(
+                    project_id,
+                    page,
+                    events,
+                ));
+                Ok(())
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_id = %project_id,
+                    page = %page,
+                    "Failed to fetch historical project events page"
+                );
+                self.sender.dispatch(GlimEvent::ProjectEventsPageLoaded(
+                    project_id,
+                    page,
+                    Vec::new(),
+                ));
+                Err(e)
+            },
+        }
+    }
+
+    /// Spawn an async task to fetch a specific historical page of project events
+    pub fn spawn_fetch_project_events_page(&self, project_id: ProjectId, page: u32) {
+        let api = self.api.clone();
+        let sender = self.sender.clone();
+        self.handle.spawn(async move {
+            let temp_service = Self::from_api(api, sender).unwrap();
+            let _ = temp_service
+                .fetch_project_events_page(project_id, page)
+                .await;
+        });
+    }
+
     /// Fetch full commit details and dispatch results
     #[instrument(skip(self), fields(project_id = %project_id, sha = %sha))]
     pub async fn fetch_commit(&self, project_id: ProjectId, sha: &str) -> Result<()> {

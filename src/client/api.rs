@@ -150,12 +150,23 @@ impl GitlabApi {
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<GitlabEventDto>> {
+        self.get_project_events_page(project_id, 1).await
+    }
+
+    /// Get a specific page of events (100 per page) for a project
+    #[instrument(skip(self), fields(project_id = %project_id, page = %page))]
+    pub async fn get_project_events_page(
+        &self,
+        project_id: ProjectId,
+        page: u32,
+    ) -> Result<Vec<GitlabEventDto>> {
         let url = {
             let config = self.config.read().unwrap();
             format_compact!(
-                "{}/projects/{}/events?per_page=60",
+                "{}/projects/{}/events?per_page=100&page={}",
                 config.base_url,
-                project_id
+                project_id,
+                page
             )
         };
         self.get_json(&url).await

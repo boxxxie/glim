@@ -286,6 +286,10 @@ impl GlimApp {
                 debug!(project_id = %id, "Requesting recent events for project");
                 self.gitlab.spawn_fetch_project_events(id);
             },
+            GlimEvent::ProjectEventsPageFetch(id, page) => {
+                debug!(project_id = %id, page = %page, "Requesting historical events page for project");
+                self.gitlab.spawn_fetch_project_events_page(id, page);
+            },
             GlimEvent::ProjectsFetch => {
                 self.gitlab.spawn_fetch_projects(None)
             },
@@ -456,6 +460,10 @@ impl GlimApp {
 
     pub fn activity_event(&self, id: u64) -> Option<&crate::domain::ProjectActivityEvent> {
         self.project_store.find_activity(id)
+    }
+
+    pub fn is_loading_more_activity(&self) -> bool {
+        self.project_store.is_loading_more_activity()
     }
 
     pub fn filtered_projects(

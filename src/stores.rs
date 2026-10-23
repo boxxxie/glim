@@ -41,6 +41,9 @@ pub struct ProjectStore {
     hydrated_pipelines: HashSet<ProjectId>,
     hydrated_mrs: HashSet<ProjectId>,
     fetched_this_session: HashSet<ProjectId>,
+    next_events_page: HashMap<ProjectId, u32>,
+    exhausted_events: HashSet<ProjectId>,
+    loading_more_events: HashSet<ProjectId>,
     last_seen_event_id: HashMap<ProjectId, u64>,
     last_seen_todo_id: Option<u64>,
     current_username: CompactString,
@@ -83,6 +86,9 @@ impl ProjectStore {
             hydrated_pipelines: HashSet::new(),
             hydrated_mrs: HashSet::new(),
             fetched_this_session: HashSet::new(),
+            next_events_page: HashMap::new(),
+            exhausted_events: HashSet::new(),
+            loading_more_events: HashSet::new(),
             last_seen_event_id: HashMap::new(),
             last_seen_todo_id: None,
             current_username: "paul".into(),
@@ -97,6 +103,10 @@ impl ProjectStore {
 
     pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
         &self.recent_activity
+    }
+
+    pub fn is_loading_more_activity(&self) -> bool {
+        !self.loading_more_events.is_empty()
     }
 
     pub fn find_activity(&self, id: u64) -> Option<&ProjectActivityEvent> {
@@ -451,6 +461,11 @@ impl ProjectStore {
                     .max()
                     .unwrap_or(prev_max_id.unwrap_or(0));
                 self.last_seen_event_id.insert(*project_id, max_id);
+                if event_dtos.len() < 100 {
+                    self.exhausted_events.insert(*project_id);
+                } else {
+                    self.next_events_page.entry(*project_id).or_insert(2);
+                }
 
                 let Some(project) = self.find(*project_id).cloned() else {
                     return;
@@ -517,6 +532,82 @@ impl ProjectStore {
                         let (summary, body, urgency) = format_activity_notification(latest);
                         self.emit_notification(&summary, &body, urgency);
                     }
+                }
+            },
+
+            GlimEvent::ActivityLoadMore => {
+                let candidate_ids: Vec<ProjectId> = self
+                    .projects
+                    .iter()
+                    .filter(|p| self.should_watch_project(p))
+                    .map(|p| p.id)
+                    .filter(|id| {
+                        !self.exhausted_events.contains(id)
+                            && !self.loading_more_events.contains(id)
+                    })
+                    .collect();
+
+                for project_id in candidate_ids {
+                    let page = *self.next_events_page.entry(project_id).or_insert(2);
+                    self.loading_more_events.insert(project_id);
+                    self.dispatch(GlimEvent::ProjectEventsPageFetch(project_id, page));
+                }
+            },
+
+            GlimEvent::ProjectEventsPageLoaded(project_id, page, event_dtos) => {
+                self.loading_more_events.remove(project_id);
+                if event_dtos.len() < 100 {
+                    self.exhausted_events.insert(*project_id);
+                } else {
+                    self.next_events_page.insert(*project_id, page + 1);
+                }
+
+                let Some(project) = self.find(*project_id).cloned() else {
+                    return;
+                };
+
+                let mut added_any = false;
+                let current_username = self.current_username.clone();
+                for dto in event_dtos {
+                    if self.ignore_bot_comments && dto.is_bot_event() {
+                        continue;
+                    }
+                    if let Some(mut activity) =
+                        convert_gitlab_event(dto, &project, &current_username)
+                    {
+                        if let Some(ref sha) = activity.commit_sha {
+                            if let Some(commit) = self.commits.get(sha) {
+                                if !commit.title.is_empty() {
+                                    activity.summary = commit.title.clone();
+                                }
+                                if !commit.message.is_empty() {
+                                    activity.body = Some(commit.message.trim().into());
+                                }
+                            } else if self.requested_commits.insert(sha.clone()) {
+                                self.dispatch(GlimEvent::CommitFetch(*project_id, sha.clone()));
+                            }
+                        }
+
+                        let already_present = self
+                            .recent_activity
+                            .iter()
+                            .any(|existing| is_duplicate_activity(existing, &activity));
+                        if !already_present {
+                            self.recent_activity.push(activity);
+                            added_any = true;
+                        }
+                    }
+                }
+
+                if added_any {
+                    self.recent_activity
+                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                    self.save_activity_cache();
+                } else if event_dtos.len() >= 100 && *page < 20 {
+                    // All events on this page were already cached locally; advance to the next page
+                    let next_page = page + 1;
+                    self.loading_more_events.insert(*project_id);
+                    self.dispatch(GlimEvent::ProjectEventsPageFetch(*project_id, next_page));
                 }
             },
 

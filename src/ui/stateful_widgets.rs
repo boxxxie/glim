@@ -538,6 +538,7 @@ impl StatefulWidgets {
             let popup_area = ad.popup_area.clone();
             *ad = ActivityDetailsPopupState::new(events[last_idx].clone(), popup_area);
         }
+        self.sender.dispatch(GlimEvent::ActivityLoadMore);
     }
 
     pub fn handle_activity_selection(&mut self, direction: i32, app: &GlimApp) {
@@ -572,6 +573,10 @@ impl StatefulWidgets {
             } else if new_index >= self.activity_feed_scroll + visible_rows {
                 self.activity_feed_scroll = new_index + 1 - visible_rows;
             }
+        }
+
+        if direction > 0 && new_index + 5 >= events.len() {
+            self.sender.dispatch(GlimEvent::ActivityLoadMore);
         }
     }
 
@@ -685,9 +690,17 @@ impl StatefulWidgets {
                         if self.activity_feed_focused {
                             self.handle_activity_selection(1, app);
                         } else {
-                            let max_scroll = app.recent_activity().len().saturating_sub(1);
+                            let total = app.recent_activity().len();
+                            let max_scroll = total.saturating_sub(1);
                             self.activity_feed_scroll =
                                 (self.activity_feed_scroll + 1).min(max_scroll);
+                            let visible_rows = self
+                                .last_feed_area
+                                .map(|r| r.height.saturating_sub(2).max(1) as usize)
+                                .unwrap_or(8);
+                            if self.activity_feed_scroll + visible_rows + 5 >= total {
+                                self.sender.dispatch(GlimEvent::ActivityLoadMore);
+                            }
                         }
                     } else {
                         self.handle_project_selection(1, app);

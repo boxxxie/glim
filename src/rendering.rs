@@ -162,6 +162,7 @@ fn render_projects_table(
             widget_states.activity_feed_scroll,
             widget_states.activity_feed_focused,
             widget_states.activity_selected_index,
+            app.is_loading_more_activity(),
         );
         f.render_widget(activity, feed_area);
     }

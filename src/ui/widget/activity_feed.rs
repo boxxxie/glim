@@ -17,6 +17,7 @@ pub struct ActivityFeed<'a> {
     scroll_offset: usize,
     focused: bool,
     selected_index: Option<usize>,
+    loading_more: bool,
 }
 
 impl<'a> ActivityFeed<'a> {
@@ -25,12 +26,14 @@ impl<'a> ActivityFeed<'a> {
         scroll_offset: usize,
         focused: bool,
         selected_index: Option<usize>,
+        loading_more: bool,
     ) -> Self {
         Self {
             events,
             scroll_offset,
             focused,
             selected_index,
+            loading_more,
         }
     }
 }
@@ -43,10 +46,19 @@ impl Widget for ActivityFeed<'_> {
 
         Clear.render(area, buf);
 
-        let title = if self.scroll_offset > 0 {
-            format!(" mr & repo activity (+{} scrolled) ", self.scroll_offset)
+        let total = self.events.len();
+        let loading_suffix = if self.loading_more {
+            " • loading older..."
         } else {
-            " mr & repo activity ".to_string()
+            ""
+        };
+        let title = if self.scroll_offset > 0 {
+            format!(
+                " mr & repo activity ({total} total, +{} scrolled{loading_suffix}) ",
+                self.scroll_offset
+            )
+        } else {
+            format!(" mr & repo activity ({total}{loading_suffix}) ")
         };
 
         let shortcuts = Shortcuts::from(vec![
