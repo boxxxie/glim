@@ -14,8 +14,8 @@ use super::{
 };
 use crate::{
     domain::{
-        GitlabEventDto, GitlabTodoDto, GitlabUserDto, JobDto, MergeRequestDto, PipelineDto,
-        ProjectDto,
+        CommitDto, GitlabEventDto, GitlabTodoDto, GitlabUserDto, JobDto, MergeRequestDto,
+        PipelineDto, ProjectDto,
     },
     id::{JobId, PipelineId, ProjectId},
 };
@@ -177,6 +177,21 @@ impl GitlabApi {
         let url = {
             let config = self.config.read().unwrap();
             format_compact!("{}/todos?per_page=25", config.base_url)
+        };
+        self.get_json(&url).await
+    }
+
+    /// Get full commit details (including untruncated multi-line commit message) for a SHA
+    #[instrument(skip(self), fields(project_id = %project_id, sha = %sha))]
+    pub async fn get_commit(&self, project_id: ProjectId, sha: &str) -> Result<CommitDto> {
+        let url = {
+            let config = self.config.read().unwrap();
+            format_compact!(
+                "{}/projects/{}/repository/commits/{}",
+                config.base_url,
+                project_id,
+                sha
+            )
         };
         self.get_json(&url).await
     }

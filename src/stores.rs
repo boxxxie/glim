@@ -11,8 +11,9 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     dispatcher::Dispatcher,
     domain::{
-        clean_multiline_body, clean_note_body, contains_mention, ActivityKind, GitlabEventDto,
-        GitlabTodoDto, Job, MergeRequest, Pipeline, PipelineStatus, Project, ProjectActivityEvent,
+        clean_multiline_body, clean_note_body, contains_mention, ActivityKind, CommitDto,
+        GitlabEventDto, GitlabTodoDto, Job, MergeRequest, Pipeline, PipelineStatus, Project,
+        ProjectActivityEvent,
     },
     event::GlimEvent,
     glim_app::GlimConfig,
@@ -40,6 +41,8 @@ pub struct ProjectStore {
     last_seen_todo_id: Option<u64>,
     current_username: CompactString,
     recent_activity: Vec<ProjectActivityEvent>,
+    commits: HashMap<CompactString, CommitDto>,
+    requested_commits: HashSet<CompactString>,
     startup_notified: bool,
 }
 
@@ -64,6 +67,8 @@ impl ProjectStore {
             last_seen_todo_id: None,
             current_username: "paul".into(),
             recent_activity: Vec::new(),
+            commits: HashMap::new(),
+            requested_commits: HashSet::new(),
             startup_notified: false,
         }
     }
@@ -253,6 +258,7 @@ impl ProjectStore {
                                                 author: "ci".into(),
                                                 mr_iid,
                                                 branch: Some(p.branch.clone()),
+                                                commit_sha: None,
                                                 summary: format!("Pipeline #{} {}", p.id, label)
                                                     .into(),
                                                 detail: None,
@@ -294,6 +300,7 @@ impl ProjectStore {
                                             author: "ci".into(),
                                             mr_iid,
                                             branch: Some(p.branch.clone()),
+                                            commit_sha: None,
                                             summary: format!("Pipeline #{} {}", p.id, label).into(),
                                             detail: None,
                                             body: Some(format!("{sum}\nBranch: {body}\nURL: {}", p.url).into()),
@@ -426,9 +433,22 @@ impl ProjectStore {
                     if self.ignore_bot_comments && dto.is_bot_event() {
                         continue;
                     }
-                    if let Some(activity) =
+                    if let Some(mut activity) =
                         convert_gitlab_event(dto, &project, &current_username)
                     {
+                        if let Some(ref sha) = activity.commit_sha {
+                            if let Some(commit) = self.commits.get(sha) {
+                                if !commit.title.is_empty() {
+                                    activity.summary = commit.title.clone();
+                                }
+                                if !commit.message.is_empty() {
+                                    activity.body = Some(commit.message.trim().into());
+                                }
+                            } else if self.requested_commits.insert(sha.clone()) {
+                                self.dispatch(GlimEvent::CommitFetch(*project_id, sha.clone()));
+                            }
+                        }
+
                         let already_present = self
                             .recent_activity
                             .iter()
@@ -518,6 +538,12 @@ impl ProjectStore {
                     .map(|j| Job::from(j.clone()))
                     .collect();
 
+                if let Some(commit_dto) = job_dtos.first().map(|j| j.commit.clone()) {
+                    if !commit_dto.id.is_empty() && !commit_dto.message.is_empty() {
+                        self.apply_commit_details(commit_dto);
+                    }
+                }
+
                 let sender = self.sender.clone();
                 if let Some(project) = self.find_mut(*project_id) {
                     project.update_jobs(*pipeline_id, jobs);
@@ -528,6 +554,24 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
+            },
+
+            GlimEvent::CommitLoaded(_project_id, commit_dto) => {
+                if !commit_dto.id.is_empty() {
+                    self.apply_commit_details(commit_dto.clone());
+                }
+            },
+
+            GlimEvent::ActivityDetailsOpen(activity_id) => {
+                if let Some((project_id, sha)) = self
+                    .find_activity(*activity_id)
+                    .and_then(|ev| ev.commit_sha.as_ref().map(|s| (ev.project_id, s.clone())))
+                {
+                    if !self.commits.contains_key(&sha) {
+                        self.requested_commits.insert(sha.clone());
+                        self.dispatch(GlimEvent::CommitFetch(project_id, sha));
+                    }
+                }
             },
 
             // requests pipelines for a project if they are not already loaded
@@ -575,6 +619,20 @@ impl ProjectStore {
         self.project_id_lookup.get(&id).copied()
     }
 
+    fn apply_commit_details(&mut self, commit: CommitDto) {
+        for ev in &mut self.recent_activity {
+            if ev.commit_sha.as_deref() == Some(commit.id.as_str()) {
+                if !commit.title.is_empty() {
+                    ev.summary = commit.title.clone();
+                }
+                if !commit.message.is_empty() {
+                    ev.body = Some(commit.message.trim().into());
+                }
+            }
+        }
+        self.commits.insert(commit.id.clone(), commit);
+    }
+
     #[instrument(skip(self, project), fields(project_id = %project.id, project_path = %project.path))]
     fn sync_project(&mut self, mut project: Project) {
         let sender = self.sender.clone();
@@ -599,6 +657,19 @@ impl ProjectStore {
     }
 }
 
+fn mr_full_body(project: &Project, mr_iid: Option<u64>, title: &CompactString) -> CompactString {
+    if let Some(desc) = mr_iid
+        .and_then(|iid| project.merge_request(iid))
+        .and_then(|mr| mr.description.as_deref())
+    {
+        let cleaned = clean_multiline_body(desc);
+        if !cleaned.is_empty() {
+            return format!("{title}\n\n{cleaned}").into();
+        }
+    }
+    title.clone()
+}
+
 pub fn convert_gitlab_event(
     dto: &GitlabEventDto,
     project: &Project,
@@ -620,6 +691,7 @@ pub fn convert_gitlab_event(
             } else {
                 ActivityKind::MrOpened
             };
+            let body = mr_full_body(project, mr_iid, &title);
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
@@ -628,19 +700,21 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title.clone(),
+                commit_sha: None,
+                summary: title,
                 detail: if action == "reopened" {
                     Some("reopened".into())
                 } else {
                     None
                 },
-                body: Some(title),
+                body: Some(body),
                 created_at: dto.created_at,
             })
         },
         ("accepted" | "merged", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
+            let body = mr_full_body(project, mr_iid, &title);
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
@@ -649,15 +723,17 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title.clone(),
+                commit_sha: None,
+                summary: title,
                 detail: None,
-                body: Some(title),
+                body: Some(body),
                 created_at: dto.created_at,
             })
         },
         ("closed", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
+            let body = mr_full_body(project, mr_iid, &title);
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
@@ -666,15 +742,17 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title.clone(),
+                commit_sha: None,
+                summary: title,
                 detail: None,
-                body: Some(title),
+                body: Some(body),
                 created_at: dto.created_at,
             })
         },
         ("approved", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
+            let body = mr_full_body(project, mr_iid, &title);
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
@@ -683,9 +761,10 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
-                summary: title.clone(),
+                commit_sha: None,
+                summary: title,
                 detail: None,
-                body: Some(title),
+                body: Some(body),
                 created_at: dto.created_at,
             })
         },
@@ -721,6 +800,7 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: None,
+                commit_sha: None,
                 summary: snippet,
                 detail,
                 body: Some(full_body),
@@ -748,6 +828,7 @@ pub fn convert_gitlab_event(
                 author,
                 mr_iid,
                 branch: Some(branch),
+                commit_sha: push.commit_to.clone(),
                 summary: commit_title.clone(),
                 detail: if push.commit_count > 1 {
                     Some(format!("{} commits", push.commit_count).into())
@@ -769,6 +850,7 @@ pub fn convert_gitlab_event(
                     author,
                     mr_iid: None,
                     branch: None,
+                    commit_sha: None,
                     summary: title.clone(),
                     detail: dto
                         .target_iid
@@ -830,6 +912,7 @@ pub fn convert_gitlab_todo(
         author: todo.author.username.clone(),
         mr_iid,
         branch: None,
+        commit_sha: None,
         summary: summary.clone(),
         detail,
         body: Some(if !full_body.is_empty() { full_body } else { summary }),

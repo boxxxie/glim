@@ -355,6 +355,41 @@ impl GitlabService {
             }
         });
     }
+
+    /// Fetch full commit details and dispatch results
+    #[instrument(skip(self), fields(project_id = %project_id, sha = %sha))]
+    pub async fn fetch_commit(&self, project_id: ProjectId, sha: &str) -> Result<()> {
+        if !self.api.is_configured() {
+            return Ok(());
+        }
+
+        match self.api.get_commit(project_id, sha).await {
+            Ok(commit) => {
+                self.sender
+                    .dispatch(GlimEvent::CommitLoaded(project_id, commit));
+                Ok(())
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_id = %project_id,
+                    sha = %sha,
+                    "Failed to fetch commit details"
+                );
+                Err(e)
+            },
+        }
+    }
+
+    /// Spawn an async task to fetch full commit details
+    pub fn spawn_fetch_commit(&self, project_id: ProjectId, sha: compact_str::CompactString) {
+        let api = self.api.clone();
+        let sender = self.sender.clone();
+        self.handle.spawn(async move {
+            let temp_service = Self::from_api(api, sender).unwrap();
+            let _ = temp_service.fetch_commit(project_id, &sha).await;
+        });
+    }
 }
 
 // Convert ClientError to the application's GlimError type

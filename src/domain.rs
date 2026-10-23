@@ -37,6 +37,7 @@ pub struct MergeRequest {
     pub iid: u64,
     pub project_id: ProjectId,
     pub title: CompactString,
+    pub description: Option<CompactString>,
     pub state: CompactString,
     pub source_branch: CompactString,
     pub target_branch: CompactString,
@@ -140,6 +141,7 @@ pub struct ProjectActivityEvent {
     pub author: CompactString,
     pub mr_iid: Option<u64>,
     pub branch: Option<CompactString>,
+    pub commit_sha: Option<CompactString>,
     pub summary: CompactString,
     pub detail: Option<CompactString>,
     pub body: Option<CompactString>,
@@ -162,7 +164,9 @@ pub struct Pipeline {
 
 #[derive(Clone, Debug)]
 pub struct Commit {
+    pub id: CompactString,
     pub title: CompactString,
+    pub message: CompactString,
     #[allow(dead_code)]
     pub author_name: CompactString,
 }
@@ -202,7 +206,13 @@ pub struct StatisticsDto {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CommitDto {
+    #[serde(default)]
+    pub id: CompactString,
+    #[serde(default)]
     pub title: CompactString,
+    #[serde(default)]
+    pub message: CompactString,
+    #[serde(default)]
     pub author_name: CompactString,
 }
 
@@ -248,6 +258,8 @@ pub struct MergeRequestDto {
     pub iid: u64,
     pub project_id: ProjectId,
     pub title: CompactString,
+    #[serde(default)]
+    pub description: Option<CompactString>,
     pub state: CompactString,
     pub source_branch: CompactString,
     pub target_branch: CompactString,
@@ -293,6 +305,7 @@ pub struct GitlabEventPushDataDto {
     pub ref_type: CompactString,
     #[serde(rename = "ref")]
     pub branch: Option<CompactString>,
+    pub commit_to: Option<CompactString>,
     pub commit_title: Option<CompactString>,
 }
 
@@ -657,6 +670,7 @@ impl From<MergeRequestDto> for MergeRequest {
             iid: dto.iid,
             project_id: dto.project_id,
             title: dto.title,
+            description: dto.description,
             state: dto.state,
             source_branch: dto.source_branch,
             target_branch: dto.target_branch,
@@ -774,7 +788,12 @@ impl From<JobDto> for Job {
 
 impl From<CommitDto> for Commit {
     fn from(c: CommitDto) -> Self {
-        Self { title: c.title, author_name: c.author_name }
+        Self {
+            id: c.id,
+            title: c.title,
+            message: c.message,
+            author_name: c.author_name,
+        }
     }
 }
 

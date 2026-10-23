@@ -230,6 +230,15 @@ impl GlimApp {
                     .unwrap_or_else(|| format!("{}/-/merge_requests/{}", project.url, mr_iid));
                 let _ = open::that(&url);
             },
+            GlimEvent::CommitOpenUrl(project_id, sha) => {
+                debug!(project_id = %project_id, sha = %sha, "Opening commit in browser");
+                let project = self.project(project_id);
+                let url = format!("{}/-/commit/{}", project.url, sha);
+                let _ = open::that(&url);
+            },
+            GlimEvent::CommitFetch(project_id, sha) => {
+                self.gitlab.spawn_fetch_commit(project_id, sha);
+            },
 
             GlimEvent::JobLogFetch(project_id, pipeline_id) => {
                 debug!(project_id = %project_id, pipeline_id = %pipeline_id, "Downloading error log");

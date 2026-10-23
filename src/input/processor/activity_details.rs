@@ -35,6 +35,8 @@ impl ActivityDetailsProcessor {
                     let ev = &state.event;
                     let open_ev = if let Some(iid) = ev.mr_iid {
                         GlimEvent::MergeRequestOpenUrl(ev.project_id, iid)
+                    } else if let Some(ref sha) = ev.commit_sha {
+                        GlimEvent::CommitOpenUrl(ev.project_id, sha.clone())
                     } else {
                         GlimEvent::ProjectOpenUrl(ev.project_id)
                     };

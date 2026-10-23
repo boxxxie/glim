@@ -342,11 +342,22 @@ fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
         widget_states.click_regions.clear();
         let popup_rect = pa.popup_area.get();
         let inner = popup_rect.inner(Margin::new(2, 1));
+        let actions_area = if pa.commit_message.is_some() {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(2),
+                    Constraint::Length(pa.actions.len() as u16),
+                ])
+                .split(inner)[1]
+        } else {
+            inner
+        };
         for (idx, action) in pa.actions.iter().enumerate() {
-            let row_y = inner.y + idx as u16;
-            if row_y < inner.bottom() {
+            let row_y = actions_area.y + idx as u16;
+            if row_y < actions_area.bottom() {
                 widget_states.click_regions.push(ClickRegion {
-                    area: Rect::new(inner.x, row_y, inner.width, 1),
+                    area: Rect::new(actions_area.x, row_y, actions_area.width, 1),
                     action: ClickAction::Dispatch(vec![
                         GlimEvent::PipelineActionsClose,
                         action.clone(),

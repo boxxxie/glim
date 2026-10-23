@@ -32,12 +32,32 @@ impl ActivityDetailsPopup {
 
 impl ActivityDetailsPopupState {
     pub fn new(event: ProjectActivityEvent, popup_area: RefRect) -> Self {
+        let actions = Self::build_actions(&event);
+
+        Self {
+            event,
+            actions,
+            list_state: ListState::default().with_selected(Some(0)),
+            popup_area,
+        }
+    }
+
+    fn build_actions(event: &ProjectActivityEvent) -> Vec<(String, GlimEvent)> {
         let mut actions = Vec::new();
         if let Some(iid) = event.mr_iid {
             actions.push((
                 format!("browse to merge request (!{iid})"),
                 GlimEvent::MergeRequestOpenUrl(event.project_id, iid),
             ));
+        }
+        if let Some(ref sha) = event.commit_sha {
+            if !sha.is_empty() {
+                let short_sha = &sha[..sha.len().min(8)];
+                actions.push((
+                    format!("browse to commit ({short_sha})"),
+                    GlimEvent::CommitOpenUrl(event.project_id, sha.clone()),
+                ));
+            }
         }
         actions.push((
             format!("browse to project ({})", event.project_name),
@@ -55,13 +75,17 @@ impl ActivityDetailsPopupState {
             "copy event text to clipboard".to_string(),
             GlimEvent::CopyToClipboard(copy_text),
         ));
+        actions
+    }
 
-        Self {
-            event,
-            actions,
-            list_state: ListState::default().with_selected(Some(0)),
-            popup_area,
+    pub fn update_commit(&mut self, commit: &crate::domain::CommitDto) {
+        if !commit.title.is_empty() {
+            self.event.summary = commit.title.clone();
         }
+        if !commit.message.is_empty() {
+            self.event.body = Some(commit.message.trim().into());
+        }
+        self.actions = Self::build_actions(&self.event);
     }
 
     pub fn selected_action_event(&self) -> Option<GlimEvent> {
@@ -167,6 +191,13 @@ impl StatefulWidget for ActivityDetailsPopup {
         }
 
         let mut header_line_2 = vec![Span::from(full_ts).style(theme().date)];
+        if let Some(ref sha) = ev.commit_sha {
+            if !sha.is_empty() {
+                let short_sha = &sha[..sha.len().min(8)];
+                header_line_2.push(Span::from("  •  commit ").style(theme().date));
+                header_line_2.push(Span::from(short_sha).style(theme().mr_iid));
+            }
+        }
         if let Some(detail) = &ev.detail {
             header_line_2.push(Span::from("  •  ").style(theme().date));
             header_line_2.push(Span::from(detail.as_str()).style(theme().mr_target));

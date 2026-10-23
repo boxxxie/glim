@@ -129,6 +129,13 @@ impl StatefulWidgets {
                 }
             },
             GlimEvent::ActivityDetailsClose => self.activity_details = None,
+            GlimEvent::CommitLoaded(_, commit) => {
+                if let Some(ad) = self.activity_details.as_mut() {
+                    if ad.event.commit_sha.as_deref() == Some(commit.id.as_str()) {
+                        ad.update_commit(commit);
+                    }
+                }
+            },
             GlimEvent::ProjectsLoaded(_) => {
                 let exclude_area_from_fx = self.current_popup_area();
                 effects.register_projects_table_new_data(exclude_area_from_fx)
@@ -246,13 +253,30 @@ impl StatefulWidgets {
     ) {
         let pipeline = project.pipeline(pipeline_id);
         let failed_job = pipeline.and_then(|p| p.failed_job());
-        let mr_iid = pipeline
-            .and_then(|p| project.merge_request_for_branch(&p.branch))
-            .map(|mr| mr.iid);
+        let mr = pipeline.and_then(|p| project.merge_request_for_branch(&p.branch));
+        let mr_iid = mr.map(|m| m.iid);
+        let commit_sha = pipeline
+            .and_then(|p| p.commit.as_ref())
+            .map(|c| c.id.clone())
+            .filter(|id| !id.is_empty());
+        let commit_message = pipeline
+            .and_then(|p| p.commit.as_ref())
+            .map(|c| {
+                if !c.message.is_empty() {
+                    c.message.trim().to_string()
+                } else {
+                    c.title.to_string()
+                }
+            })
+            .filter(|m| !m.is_empty())
+            .or_else(|| mr.map(|m| m.title.to_string()));
 
         let mut actions = Vec::new();
         if let Some(iid) = mr_iid {
             actions.push(GlimEvent::MergeRequestOpenUrl(project.id, iid));
+        }
+        if let Some(ref sha) = commit_sha {
+            actions.push(GlimEvent::CommitOpenUrl(project.id, sha.clone()));
         }
         if let Some(job) = failed_job {
             actions.push(GlimEvent::JobOpenUrl(project.id, pipeline_id, job.id));
@@ -263,8 +287,15 @@ impl StatefulWidgets {
             actions.push(GlimEvent::PipelineOpenUrl(project.id, pipeline_id));
             actions.push(GlimEvent::ProjectOpenUrl(project.id));
         }
+        if let Some(ref msg) = commit_message {
+            actions.push(GlimEvent::CopyToClipboard(msg.as_str().into()));
+        }
 
-        self.pipeline_actions = Some(PipelineActionsPopupState::new(actions, popup_area));
+        self.pipeline_actions = Some(PipelineActionsPopupState::new(
+            actions,
+            commit_message,
+            popup_area,
+        ));
     }
 
     fn close_pipeline_actions(&mut self) {

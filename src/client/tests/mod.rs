@@ -82,7 +82,9 @@ pub fn sample_job_dto() -> JobDto {
         name: "test-job".into(),
         stage: "test".into(),
         commit: CommitDto {
+            id: "0123456789abcdef".into(),
             title: "Test commit".into(),
+            message: "Test commit\n\nDetailed commit message".into(),
             author_name: "Test Author".into(),
         },
         status: crate::domain::PipelineStatus::Success,
