@@ -103,6 +103,10 @@ pub struct EffectRegistry {
     screen_area: RefRect,
     /// Whether animations are enabled
     animations_enabled: bool,
+    /// Whether the random character glitch effect is enabled
+    glitch_effect_enabled: bool,
+    /// Whether the table sweep-in effect on project refresh is enabled
+    table_sweep_enabled: bool,
 }
 
 impl EffectRegistry {
@@ -121,6 +125,8 @@ impl EffectRegistry {
             screen_area: RefRect::default(),
             sender,
             animations_enabled: true, // default to enabled
+            glitch_effect_enabled: true,
+            table_sweep_enabled: true,
         }
     }
 
@@ -146,7 +152,12 @@ impl EffectRegistry {
             ProjectDetailsClose => self.register_close_popup(FxId::ProjectDetailsPopup),
             PipelineActionsClose => self.register_close_popup(FxId::PipelineActionsPopup),
             ConfigClose => self.register_close_popup(FxId::ConfigPopup),
-            ConfigUpdate(config) => self.animations_enabled = config.animations,
+            ConfigUpdate(config) => {
+                self.animations_enabled = config.animations;
+                self.glitch_effect_enabled = config.glitch_effect;
+                self.table_sweep_enabled = config.table_sweep_effect;
+                self.register_default_glitch_effect();
+            },
             _ => (),
         }
     }
@@ -192,6 +203,10 @@ impl EffectRegistry {
     ///
     /// A parallel effect combining coalescing and left-to-right sweep animation
     pub fn register_projects_table_new_data(&mut self, exclude_popup_area: Option<RefRect>) {
+        if !self.animations_enabled || !self.table_sweep_enabled {
+            return;
+        }
+
         let filter = match exclude_popup_area {
             Some(area) => AllOf(vec![Inner(Margin::new(1, 1)), Not(RefArea(area).into())]),
             None => Inner(Margin::new(1, 1)),
@@ -226,7 +241,7 @@ impl EffectRegistry {
     /// - **Inactive**: Falls back to default low-intensity glitch
     /// - **RampedUp**: Higher intensity with more frequent glitch bursts
     pub fn register_glitch_effect(&mut self, glitch_state: GlitchState) {
-        let fx = if self.animations_enabled {
+        let fx = if self.animations_enabled && self.glitch_effect_enabled {
             match glitch_state {
                 GlitchState::Normal => default_glitch_effect(),
                 GlitchState::RampedUp => Glitch::builder()

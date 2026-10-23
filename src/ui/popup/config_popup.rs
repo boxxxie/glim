@@ -224,6 +224,8 @@ impl ConfigPopupState {
             search_filter,
             log_level,
             animations,
+            glitch_effect: self.base_config.glitch_effect,
+            table_sweep_effect: self.base_config.table_sweep_effect,
             max_pipelines_per_project,
             max_recent_pipelines: self.base_config.max_recent_pipelines,
             max_age_days,

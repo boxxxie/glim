@@ -72,8 +72,14 @@ pub struct GlimConfig {
     /// Logging level: Off, Error, Warn, Info, Debug, Trace
     pub log_level: Option<CompactString>,
     /// Enable animations (default: true)
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub animations: bool,
+    /// Enable random character glitch effect (default: true)
+    #[serde(default = "default_true")]
+    pub glitch_effect: bool,
+    /// Enable full-table sweep/fade-in effect on project refresh (default: true)
+    #[serde(default = "default_true")]
+    pub table_sweep_effect: bool,
     /// Maximum number of pipelines (branches/MRs) displayed per project in the main table
     #[serde(default = "default_max_pipelines_per_project")]
     pub max_pipelines_per_project: usize,
@@ -117,6 +123,8 @@ impl Default for GlimConfig {
             search_filter: None,
             log_level: Some("Error".into()),
             animations: true,
+            glitch_effect: true,
+            table_sweep_effect: true,
             max_pipelines_per_project: default_max_pipelines_per_project(),
             max_recent_pipelines: default_max_recent_pipelines(),
             max_age_days: None,
