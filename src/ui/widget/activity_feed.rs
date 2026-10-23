@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::{domain::ProjectActivityEvent, theme::theme};
+use crate::{
+    domain::{ActivityKind, ProjectActivityEvent},
+    theme::theme,
+};
 
 pub struct ActivityFeed<'a> {
     events: &'a [ProjectActivityEvent],
@@ -62,6 +65,11 @@ impl Widget for ActivityFeed<'_> {
             .map(|ev| {
                 let local_ts = ev.created_at.with_timezone(&Local);
                 let mut spans = crate::ui::format_timestamp_spans(local_ts);
+                let action_style = match ev.kind {
+                    ActivityKind::Mention | ActivityKind::MergeTrainRemoved => theme().mr_conflict,
+                    ActivityKind::ReviewRequested | ActivityKind::Assigned => theme().mr_draft,
+                    _ => theme().activity_action,
+                };
                 spans.extend([
                     Span::from(" "),
                     Span::from(ev.kind.icon()),
@@ -70,7 +78,7 @@ impl Widget for ActivityFeed<'_> {
                     Span::from(" "),
                     Span::from(format!("@{}", ev.author)).style(theme().activity_author),
                     Span::from(" "),
-                    Span::from(ev.kind.action_label()).style(theme().activity_action),
+                    Span::from(ev.kind.action_label()).style(action_style),
                 ]);
 
                 if let Some(mr_iid) = ev.mr_iid {
@@ -87,7 +95,9 @@ impl Widget for ActivityFeed<'_> {
                 }
 
                 if let Some(detail) = &ev.detail {
-                    spans.push(Span::from(format!(" ({detail})")).style(theme().mr_target));
+                    if !detail.is_empty() && detail != &ev.summary {
+                        spans.push(Span::from(format!(" ({detail})")).style(theme().mr_target));
+                    }
                 }
 
                 Line::from(spans)

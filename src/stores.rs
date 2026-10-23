@@ -423,12 +423,16 @@ impl ProjectStore {
                     if let Some(activity) =
                         convert_gitlab_event(dto, &project, &current_username)
                     {
+                        let already_present = self
+                            .recent_activity
+                            .iter()
+                            .any(|existing| is_duplicate_activity(existing, &activity));
                         if let Some(prev_max) = prev_max_id {
-                            if activity.id > prev_max {
+                            if activity.id > prev_max && !already_present {
                                 newly_arrived.push(activity.clone());
                             }
                         }
-                        if !self.recent_activity.iter().any(|existing| existing.id == activity.id) {
+                        if !already_present {
                             self.recent_activity.push(activity);
                         }
                     }
@@ -475,16 +479,16 @@ impl ProjectStore {
                 let current_username = self.current_username.clone();
                 for todo in todos {
                     if let Some(activity) = convert_gitlab_todo(todo, &current_username) {
+                        let already_present = self
+                            .recent_activity
+                            .iter()
+                            .any(|existing| is_duplicate_activity(existing, &activity));
                         if let Some(prev_max) = prev_max_todo_id {
-                            if todo.id > prev_max {
+                            if todo.id > prev_max && !already_present {
                                 newly_arrived.push(activity.clone());
                             }
                         }
-                        if !self
-                            .recent_activity
-                            .iter()
-                            .any(|existing| existing.id == activity.id)
-                        {
+                        if !already_present {
                             self.recent_activity.push(activity);
                         }
                     }
@@ -602,7 +606,7 @@ pub fn convert_gitlab_event(
     let is_self = author.eq_ignore_ascii_case(current_username);
 
     match (action, target_type) {
-        ("opened", "MergeRequest") => {
+        ("opened" | "created" | "reopened", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
             let kind = if !is_self && contains_mention(&title, current_username) {
@@ -619,7 +623,11 @@ pub fn convert_gitlab_event(
                 mr_iid,
                 branch: None,
                 summary: title,
-                detail: None,
+                detail: if action == "reopened" {
+                    Some("reopened".into())
+                } else {
+                    None
+                },
                 created_at: dto.created_at,
             })
         },
@@ -673,16 +681,22 @@ pub fn convert_gitlab_event(
         },
         (a, _) if a.starts_with("commented") => {
             let note = dto.note.as_ref()?;
+            let is_mr_note = note.noteable_type.as_deref() == Some("MergeRequest")
+                || target_type == "MergeRequest";
             let is_mention = !is_self && contains_mention(&note.body, current_username);
-            if !is_mention && note.noteable_type.as_deref() != Some("MergeRequest") {
+            if !is_mention && !is_mr_note {
                 return None;
             }
-            let mr_iid = note.noteable_iid.or(dto.target_iid);
+            let mr_iid = if is_mr_note {
+                note.noteable_iid.or(dto.target_iid)
+            } else {
+                None
+            };
             let snippet = clean_note_body(&note.body, 90);
             if snippet.is_empty() {
                 return None;
             }
-            let mr_title = dto.target_title.clone();
+            let detail = dto.target_title.clone().filter(|t| t != &snippet);
             let kind = if is_mention {
                 ActivityKind::Mention
             } else {
@@ -697,12 +711,15 @@ pub fn convert_gitlab_event(
                 mr_iid,
                 branch: None,
                 summary: snippet,
-                detail: mr_title,
+                detail,
                 created_at: dto.created_at,
             })
         },
         (a, _) if a.starts_with("pushed") => {
             let push = dto.push_data.as_ref()?;
+            if push.action == "removed" || push.ref_type == "tag" {
+                return None;
+            }
             let branch = push.branch.clone()?;
             let mr_iid = project
                 .merge_request_for_branch(&branch)
@@ -728,6 +745,27 @@ pub fn convert_gitlab_event(
                 created_at: dto.created_at,
             })
         },
+        (_, "Issue" | "WorkItem" | "Milestone") => {
+            let title = dto.target_title.clone().unwrap_or_default();
+            if !is_self && contains_mention(&title, current_username) {
+                Some(ProjectActivityEvent {
+                    id: dto.id,
+                    project_id: project.id,
+                    project_name,
+                    kind: ActivityKind::Mention,
+                    author,
+                    mr_iid: None,
+                    branch: None,
+                    summary: title,
+                    detail: dto
+                        .target_iid
+                        .map(|iid| format!("{target_type} #{iid}").into()),
+                    created_at: dto.created_at,
+                })
+            } else {
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -748,17 +786,27 @@ pub fn convert_gitlab_todo(
         .into();
     let kind = match todo.action_name.as_str() {
         "mentioned" | "directly_addressed" => ActivityKind::Mention,
-        "review_requested" | "approval_required" | "assigned" => ActivityKind::ReviewRequested,
+        "review_requested" | "approval_required" => ActivityKind::ReviewRequested,
+        "assigned" => ActivityKind::Assigned,
+        "merge_train_removed" => ActivityKind::MergeTrainRemoved,
         _ => return None,
     };
-    let mr_iid = todo.target.as_ref().and_then(|t| t.iid);
+    let is_mr = todo.target_type == "MergeRequest";
+    let mr_iid = if is_mr {
+        todo.target.as_ref().and_then(|t| t.iid)
+    } else {
+        None
+    };
     let target_title = todo.target.as_ref().and_then(|t| t.title.clone());
     let snippet = clean_note_body(&todo.body, 90);
     let summary = if !snippet.is_empty() {
         snippet
     } else {
-        target_title.clone().unwrap_or_else(|| todo.action_name.clone())
+        target_title
+            .clone()
+            .unwrap_or_else(|| todo.action_name.clone())
     };
+    let detail = target_title.filter(|t| t != &summary);
     Some(ProjectActivityEvent {
         id: todo.id + 1_000_000_000,
         project_id: project.id,
@@ -768,9 +816,26 @@ pub fn convert_gitlab_todo(
         mr_iid,
         branch: None,
         summary,
-        detail: target_title,
+        detail,
         created_at: todo.created_at,
     })
+}
+
+fn is_duplicate_activity(
+    existing: &ProjectActivityEvent,
+    candidate: &ProjectActivityEvent,
+) -> bool {
+    if existing.id == candidate.id {
+        return true;
+    }
+    existing.project_id == candidate.project_id
+        && existing.mr_iid == candidate.mr_iid
+        && existing.author == candidate.author
+        && existing.summary == candidate.summary
+        && (existing.created_at - candidate.created_at)
+            .num_seconds()
+            .abs()
+            <= 15
 }
 
 fn format_activity_notification(
@@ -791,9 +856,10 @@ fn format_activity_notification(
         mr_ref
     );
     let body = ev.summary.to_string();
-    let urgency = match ev.kind {
-        ActivityKind::Mention | ActivityKind::ReviewRequested => NotifyUrgency::Critical,
-        _ => NotifyUrgency::Normal,
+    let urgency = if ev.kind.is_direct_attention() {
+        NotifyUrgency::Critical
+    } else {
+        NotifyUrgency::Normal
     };
     (summary, body, urgency)
 }
@@ -1009,5 +1075,37 @@ mod tests {
         assert_eq!(mr.iid, 61);
         assert_eq!(mr.upvotes, 1);
         assert_eq!(mr.user_notes_count, 2);
+    }
+
+    #[test]
+    fn test_todo_conversion_and_deduplication() {
+        let unmergeable_todo: GitlabTodoDto = serde_json::from_value(serde_json::json!({
+            "id": 270,
+            "action_name": "unmergeable",
+            "target_type": "MergeRequest",
+            "author": { "username": "paul" },
+            "project": { "id": 4, "path_with_namespace": "nvestiv/iris-ex" },
+            "target": { "iid": 13, "title": "feat: migration" },
+            "body": "feat: migration",
+            "created_at": "2026-10-23T08:49:29.483Z"
+        }))
+        .unwrap();
+        assert!(convert_gitlab_todo(&unmergeable_todo, "paul").is_none());
+
+        let review_todo: GitlabTodoDto = serde_json::from_value(serde_json::json!({
+            "id": 271,
+            "action_name": "review_requested",
+            "target_type": "MergeRequest",
+            "author": { "username": "saad" },
+            "project": { "id": 24, "path_with_namespace": "caasa/connect" },
+            "target": { "iid": 61, "title": "Emails 6" },
+            "body": "Emails 6",
+            "created_at": "2026-10-23T08:50:00.000Z"
+        }))
+        .unwrap();
+        let review_ev = convert_gitlab_todo(&review_todo, "paul").unwrap();
+        assert_eq!(review_ev.kind, ActivityKind::ReviewRequested);
+        assert_eq!(review_ev.summary, "Emails 6");
+        assert_eq!(review_ev.detail, None); // deduplicated when body == target.title
     }
 }

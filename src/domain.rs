@@ -75,6 +75,8 @@ impl MergeRequest {
 pub enum ActivityKind {
     Mention,
     ReviewRequested,
+    Assigned,
+    MergeTrainRemoved,
     MrOpened,
     MrMerged,
     MrClosed,
@@ -89,6 +91,8 @@ impl ActivityKind {
         match self {
             ActivityKind::Mention => "📣",
             ActivityKind::ReviewRequested => "👀",
+            ActivityKind::Assigned => "📌",
+            ActivityKind::MergeTrainRemoved => "🚂",
             ActivityKind::MrOpened => "🟣",
             ActivityKind::MrMerged => "🟢",
             ActivityKind::MrClosed => "🚫",
@@ -103,6 +107,8 @@ impl ActivityKind {
         match self {
             ActivityKind::Mention => "mentioned you",
             ActivityKind::ReviewRequested => "requested review",
+            ActivityKind::Assigned => "assigned you",
+            ActivityKind::MergeTrainRemoved => "removed from merge train",
             ActivityKind::MrOpened => "opened",
             ActivityKind::MrMerged => "merged",
             ActivityKind::MrClosed => "closed",
@@ -111,6 +117,16 @@ impl ActivityKind {
             ActivityKind::BranchPush => "pushed",
             ActivityKind::PipelineStatus => "pipeline",
         }
+    }
+
+    pub fn is_direct_attention(&self) -> bool {
+        matches!(
+            self,
+            ActivityKind::Mention
+                | ActivityKind::ReviewRequested
+                | ActivityKind::Assigned
+                | ActivityKind::MergeTrainRemoved
+        )
     }
 }
 
