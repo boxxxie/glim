@@ -1,11 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
     sync::mpsc::Sender,
 };
 
 use chrono::{DateTime, Utc};
 use compact_str::CompactString;
 use itertools::Itertools;
+use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
@@ -21,10 +25,12 @@ use crate::{
     os_notify::{send_os_notification, NotifyUrgency},
 };
 
-const MAX_ACTIVITY_EVENTS: usize = 100;
+const MAX_ACTIVITY_EVENTS: usize = 1000;
+const MAX_CACHED_COMMITS: usize = 1000;
 
 pub struct ProjectStore {
     sender: Sender<GlimEvent>,
+    cache_dir: Option<PathBuf>,
     projects: Vec<Project>,
     project_id_lookup: HashMap<ProjectId, usize>,
     sorted: Vec<Project>,
@@ -37,6 +43,7 @@ pub struct ProjectStore {
     exclude_projects: Option<Vec<CompactString>>,
     hydrated_pipelines: HashSet<ProjectId>,
     hydrated_mrs: HashSet<ProjectId>,
+    fetched_this_session: HashSet<ProjectId>,
     last_seen_event_id: HashMap<ProjectId, u64>,
     last_seen_todo_id: Option<u64>,
     current_username: CompactString,
@@ -48,9 +55,24 @@ pub struct ProjectStore {
 
 impl ProjectStore {
     pub fn new(sender: Sender<GlimEvent>, config: &GlimConfig) -> Self {
+        #[cfg(test)]
+        let cache_dir = None;
+        #[cfg(not(test))]
+        let cache_dir = directories::BaseDirs::new()
+            .map(|d| d.data_local_dir().join("glim").join("cache"));
+
+        Self::with_cache_dir(sender, config, cache_dir)
+    }
+
+    pub fn with_cache_dir(
+        sender: Sender<GlimEvent>,
+        config: &GlimConfig,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
         let auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
-        Self {
+        let mut store = Self {
             sender,
+            cache_dir,
             projects: Vec::new(),
             project_id_lookup: HashMap::new(),
             sorted: Vec::new(),
@@ -63,6 +85,7 @@ impl ProjectStore {
             exclude_projects: config.exclude_projects.clone(),
             hydrated_pipelines: HashSet::new(),
             hydrated_mrs: HashSet::new(),
+            fetched_this_session: HashSet::new(),
             last_seen_event_id: HashMap::new(),
             last_seen_todo_id: None,
             current_username: "paul".into(),
@@ -70,7 +93,9 @@ impl ProjectStore {
             commits: HashMap::new(),
             requested_commits: HashSet::new(),
             startup_notified: false,
-        }
+        };
+        store.load_disk_cache();
+        store
     }
 
     pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
@@ -167,13 +192,16 @@ impl ProjectStore {
                     .iter()
                     .map(|p| Project::from(p.clone()))
                     .for_each(|p| {
-                        let project = p.clone();
+                        let id = p.id;
                         self.sync_project(p);
-                        let sender = self.sender.clone();
-                        sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project)))
+                        if let Some(merged) = self.find(id).cloned() {
+                            let sender = self.sender.clone();
+                            sender.dispatch(GlimEvent::ProjectUpdated(Box::new(merged)));
+                        }
                     });
 
                 self.sorted = self.projects_sorted_by_last_activity();
+                self.save_projects_cache();
                 if first_projects {
                     if let Some(first) = self.sorted.first() {
                         self.dispatch(GlimEvent::ProjectSelected(first.id));
@@ -321,12 +349,17 @@ impl ProjectStore {
                     sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())))
                 }
 
+                let has_pipeline_events = !pipeline_feed_events.is_empty();
                 for ev in pipeline_feed_events {
                     self.recent_activity.push(ev);
                 }
                 self.recent_activity
                     .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+                self.save_activity_cache();
+                if has_pipeline_events {
+                    self.save_activity_cache();
+                }
 
                 self.hydrated_pipelines.insert(project_id);
                 for (summary, body, urgency) in notifications {
@@ -334,6 +367,7 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
+                self.save_projects_cache();
             },
 
             // updates open merge requests for a project
@@ -405,6 +439,7 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
+                self.save_projects_cache();
             },
 
             // updates recent project events (MR opens/merges/comments/pushes)
@@ -467,6 +502,7 @@ impl ProjectStore {
                 self.recent_activity
                     .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+                self.save_activity_cache();
 
                 // Emit notifications for newly arrived events in chronological order
                 newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -523,6 +559,7 @@ impl ProjectStore {
                 self.recent_activity
                     .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+                self.save_activity_cache();
 
                 newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
                 for ev in newly_arrived {
@@ -554,6 +591,7 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
+                self.save_projects_cache();
             },
 
             GlimEvent::CommitLoaded(_project_id, commit_dto) => {
@@ -574,20 +612,22 @@ impl ProjectStore {
                 }
             },
 
-            // requests pipelines for a project if they are not already loaded
+            // requests pipelines for a project if they have not been fetched yet this session
             GlimEvent::ProjectSelected(id) => {
                 debug!(project_id = %id, "Project selected");
                 let mut request_pipelines = false;
-                if let Some(project) = self.find_mut(*id) {
-                    if project.pipelines.is_none() {
-                        project.pipelines = Some(Vec::new());
+                if self.fetched_this_session.insert(*id) {
+                    if let Some(project) = self.find_mut(*id) {
+                        if project.pipelines.is_none() {
+                            project.pipelines = Some(Vec::new());
+                        }
                         request_pipelines = true;
                     }
-                };
+                }
 
                 if request_pipelines {
                     self.dispatch(GlimEvent::PipelinesFetch(*id));
-                };
+                }
             },
             _ => {},
         }
@@ -620,23 +660,34 @@ impl ProjectStore {
     }
 
     fn apply_commit_details(&mut self, commit: CommitDto) {
+        let mut updated_activity = false;
         for ev in &mut self.recent_activity {
             if ev.commit_sha.as_deref() == Some(commit.id.as_str()) {
-                if !commit.title.is_empty() {
+                if !commit.title.is_empty() && ev.summary != commit.title {
                     ev.summary = commit.title.clone();
+                    updated_activity = true;
                 }
-                if !commit.message.is_empty() {
-                    ev.body = Some(commit.message.trim().into());
+                let trimmed: CompactString = commit.message.trim().into();
+                if !trimmed.is_empty() && ev.body.as_ref() != Some(&trimmed) {
+                    ev.body = Some(trimmed);
+                    updated_activity = true;
                 }
             }
         }
         self.commits.insert(commit.id.clone(), commit);
+        self.save_commits_cache();
+        if updated_activity {
+            self.save_activity_cache();
+        }
     }
 
     #[instrument(skip(self, project), fields(project_id = %project.id, project_path = %project.path))]
     fn sync_project(&mut self, mut project: Project) {
         let sender = self.sender.clone();
         let watch = self.should_watch_project(&project);
+        if watch {
+            self.fetched_this_session.insert(project.id);
+        }
         match self.find_mut(project.id) {
             Some(existing_entry) => {
                 existing_entry.update_project(project.clone());
@@ -654,6 +705,132 @@ impl ProjectStore {
                 self.projects.push(project);
             },
         }
+    }
+
+    fn load_disk_cache(&mut self) {
+        let Some(ref dir) = self.cache_dir.clone() else {
+            return;
+        };
+
+        let cached_commits: Vec<CommitDto> = read_jsonl(&dir.join("commits.jsonl"));
+        for c in cached_commits {
+            if !c.id.is_empty() {
+                self.requested_commits.insert(c.id.clone());
+                self.commits.insert(c.id.clone(), c);
+            }
+        }
+
+        let cached_projects: Vec<Project> = read_jsonl(&dir.join("projects.jsonl"));
+        for p in cached_projects {
+            if !self.project_id_lookup.contains_key(&p.id) {
+                self.project_id_lookup.insert(p.id, self.projects.len());
+                self.projects.push(p);
+            }
+        }
+        if !self.projects.is_empty() {
+            self.sorted = self.projects_sorted_by_last_activity();
+            if let Some(first) = self.sorted.first() {
+                let _ = self.sender.send(GlimEvent::ProjectSelected(first.id));
+            }
+        }
+
+        let cached_events: Vec<ProjectActivityEvent> =
+            read_jsonl(&dir.join("activity_events.jsonl"));
+        for mut ev in cached_events {
+            if let Some(ref sha) = ev.commit_sha {
+                if let Some(commit) = self.commits.get(sha) {
+                    if !commit.title.is_empty() {
+                        ev.summary = commit.title.clone();
+                    }
+                    if !commit.message.is_empty() {
+                        ev.body = Some(commit.message.trim().into());
+                    }
+                }
+            }
+            if ev.kind != ActivityKind::PipelineStatus {
+                if ev.id >= 1_000_000_000 && ev.id < 2_000_000_000 {
+                    let todo_id = ev.id - 1_000_000_000;
+                    self.last_seen_todo_id =
+                        Some(self.last_seen_todo_id.unwrap_or(0).max(todo_id));
+                } else if ev.id < 1_000_000_000 {
+                    let entry = self.last_seen_event_id.entry(ev.project_id).or_insert(0);
+                    *entry = (*entry).max(ev.id);
+                }
+            }
+            if !self
+                .recent_activity
+                .iter()
+                .any(|existing| is_duplicate_activity(existing, &ev))
+            {
+                self.recent_activity.push(ev);
+            }
+        }
+        if !self.recent_activity.is_empty() {
+            self.recent_activity
+                .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+            self.startup_notified = true;
+        }
+    }
+
+    fn save_projects_cache(&self) {
+        if let Some(ref dir) = self.cache_dir {
+            write_jsonl(&dir.join("projects.jsonl"), self.projects.iter());
+        }
+    }
+
+    fn save_activity_cache(&self) {
+        if let Some(ref dir) = self.cache_dir {
+            write_jsonl(
+                &dir.join("activity_events.jsonl"),
+                self.recent_activity.iter(),
+            );
+        }
+    }
+
+    fn save_commits_cache(&self) {
+        if let Some(ref dir) = self.cache_dir {
+            write_jsonl(
+                &dir.join("commits.jsonl"),
+                self.commits.values().take(MAX_CACHED_COMMITS),
+            );
+        }
+    }
+}
+
+fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<T>(&line).ok())
+        .collect()
+}
+
+fn write_jsonl<'a, T: Serialize + 'a>(path: &Path, items: impl IntoIterator<Item = &'a T>) {
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let Ok(file) = File::create(&tmp_path) else {
+        return;
+    };
+    let mut writer = BufWriter::new(file);
+    for item in items {
+        if serde_json::to_writer(&mut writer, item).is_err() {
+            return;
+        }
+        if writer.write_all(b"\n").is_err() {
+            return;
+        }
+    }
+    if writer.flush().is_ok() {
+        let _ = fs::rename(&tmp_path, path);
     }
 }
 
@@ -1206,5 +1383,59 @@ mod tests {
         assert_eq!(review_ev.kind, ActivityKind::ReviewRequested);
         assert_eq!(review_ev.summary, "Emails 6");
         assert_eq!(review_ev.detail, None); // deduplicated when body == target.title
+    }
+
+    #[test]
+    fn test_disk_cache_roundtrip() {
+        let tmp_dir = std::env::temp_dir().join(format!("glim_cache_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut config = GlimConfig::default();
+        config.os_notifications = false;
+
+        let mut store = ProjectStore::with_cache_dir(tx.clone(), &config, Some(tmp_dir.clone()));
+        let dto = ProjectDto {
+            id: ProjectId::new(24),
+            path_with_namespace: "caasa/connect".into(),
+            description: Some("Connect API".into()),
+            default_branch: "master".into(),
+            ssh_url_to_repo: "git@gitlab.nvestiv.com:caasa/connect.git".into(),
+            web_url: "https://gitlab.nvestiv.com/caasa/connect".into(),
+            last_activity_at: Utc::now(),
+            statistics: StatisticsDto::default(),
+        };
+        store.apply(&GlimEvent::ProjectsLoaded(vec![dto]));
+
+        let comment = GitlabEventDto {
+            id: 2890,
+            project_id: ProjectId::new(24),
+            action_name: "commented on".into(),
+            target_type: Some("DiscussionNote".into()),
+            target_iid: Some(3010),
+            target_title: Some("Emails 6".into()),
+            author_username: "saad".into(),
+            created_at: Utc::now(),
+            note: Some(GitlabEventNoteDto {
+                id: 3010,
+                body: "<p>Cached comment body</p>".into(),
+                noteable_type: Some("MergeRequest".into()),
+                noteable_iid: Some(61),
+                system: false,
+            }),
+            push_data: None,
+        };
+        store.apply(&GlimEvent::ProjectEventsLoaded(
+            ProjectId::new(24),
+            vec![comment],
+        ));
+
+        let reloaded = ProjectStore::with_cache_dir(tx, &config, Some(tmp_dir.clone()));
+        assert_eq!(reloaded.sorted_projects().len(), 1);
+        assert_eq!(reloaded.sorted_projects()[0].path, "caasa/connect");
+        assert_eq!(reloaded.recent_activity().len(), 1);
+        assert_eq!(reloaded.recent_activity()[0].summary, "Cached comment body");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::Row,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     id::{JobId, PipelineId, ProjectId},
@@ -14,7 +14,7 @@ use crate::{
     ui::{format_duration, widget::text_from},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub path: CompactString,
@@ -30,7 +30,7 @@ pub struct Project {
     pub artifacts_size_kb: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct MergeRequest {
     pub id: u64,
@@ -71,7 +71,7 @@ impl MergeRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum ActivityKind {
     Mention,
@@ -131,7 +131,7 @@ impl ActivityKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ProjectActivityEvent {
     pub id: u64,
@@ -141,14 +141,16 @@ pub struct ProjectActivityEvent {
     pub author: CompactString,
     pub mr_iid: Option<u64>,
     pub branch: Option<CompactString>,
+    #[serde(default)]
     pub commit_sha: Option<CompactString>,
     pub summary: CompactString,
     pub detail: Option<CompactString>,
+    #[serde(default)]
     pub body: Option<CompactString>,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
     pub id: PipelineId,
     pub project_id: ProjectId,
@@ -162,16 +164,18 @@ pub struct Pipeline {
     pub commit: Option<Commit>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Commit {
+    #[serde(default)]
     pub id: CompactString,
     pub title: CompactString,
+    #[serde(default)]
     pub message: CompactString,
     #[allow(dead_code)]
     pub author_name: CompactString,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub name: CompactString,
@@ -204,7 +208,7 @@ pub struct StatisticsDto {
     pub repository_size: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitDto {
     #[serde(default)]
     pub id: CompactString,
@@ -463,7 +467,7 @@ pub fn clean_note_body(raw: &str, max_chars: usize) -> CompactString {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineStatus {
     #[default]
@@ -483,7 +487,7 @@ pub enum PipelineStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineSource {
     #[default]
@@ -724,10 +728,14 @@ impl Project {
     pub fn update_project(&mut self, project: Project) {
         self.id = project.id;
         self.path = project.path;
+        self.description = project.description;
         self.default_branch = project.default_branch;
         self.ssh_git_url = project.ssh_git_url;
         self.url = project.url;
         self.last_activity_at = project.last_activity_at;
+        self.commit_count = project.commit_count;
+        self.repo_size_kb = project.repo_size_kb;
+        self.artifacts_size_kb = project.artifacts_size_kb;
     }
 
     pub fn update_jobs(&mut self, pipeline_id: PipelineId, jobs: Vec<Job>) {

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub struct JobId {
@@ -34,6 +34,33 @@ impl PipelineId {
 impl JobId {
     pub fn new(id: u32) -> Self {
         Self { value: id }
+    }
+}
+
+impl Serialize for ProjectId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+impl Serialize for PipelineId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+impl Serialize for JobId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.value.serialize(serializer)
     }
 }
 
