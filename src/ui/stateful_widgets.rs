@@ -388,7 +388,11 @@ impl StatefulWidgets {
             return;
         }
 
-        let current = self.activity_selected_index.unwrap_or(0);
+        let current = self
+            .selected_activity_id
+            .and_then(|id| events.iter().position(|e| e.id == id))
+            .or(self.activity_selected_index)
+            .unwrap_or(0);
         let new_index = match direction {
             1 => current.saturating_add(1),
             -1 => current.saturating_sub(1),
@@ -398,6 +402,11 @@ impl StatefulWidgets {
 
         self.activity_selected_index = Some(new_index);
         self.selected_activity_id = Some(events[new_index].id);
+
+        if let Some(ad) = self.activity_details.as_mut() {
+            let popup_area = ad.popup_area.clone();
+            *ad = ActivityDetailsPopupState::new(events[new_index].clone(), popup_area);
+        }
 
         if let Some(feed_rect) = self.last_feed_area {
             let visible_rows = feed_rect.height.saturating_sub(2).max(1) as usize;

@@ -142,6 +142,7 @@ impl StatefulWidget for ActivityDetailsPopup {
             "Activity Event Details",
             Some(vec![
                 ("ESC", "close"),
+                ("← →", "prev/next event"),
                 ("↑ ↓", "selection"),
                 ("↵", "apply"),
                 ("w", "open web"),

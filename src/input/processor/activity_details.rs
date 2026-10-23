@@ -20,6 +20,12 @@ impl ActivityDetailsProcessor {
             },
             KeyCode::Up | KeyCode::Char('k') => ui.handle_activity_action_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => ui.handle_activity_action_selection(1),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.sender.dispatch(GlimEvent::ActivityPrevious);
+            },
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.sender.dispatch(GlimEvent::ActivityNext);
+            },
             KeyCode::Enter | KeyCode::Char('o') => {
                 let action = ui
                     .activity_details
