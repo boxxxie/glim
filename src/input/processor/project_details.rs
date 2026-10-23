@@ -29,10 +29,11 @@ impl ProjectDetailsProcessor {
             KeyCode::Char('q') => self
                 .sender
                 .dispatch(GlimEvent::ProjectDetailsClose),
-            KeyCode::Up => ui.handle_pipeline_selection(-1),
-            KeyCode::Down => ui.handle_pipeline_selection(1),
-            KeyCode::Char('k') => ui.handle_pipeline_selection(-1),
-            KeyCode::Char('j') => ui.handle_pipeline_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => ui.handle_pipeline_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => ui.handle_pipeline_selection(1),
+            KeyCode::PageUp => ui.handle_pipeline_page(-5),
+            KeyCode::PageDown => ui.handle_pipeline_page(5),
+            KeyCode::Home => ui.handle_pipeline_home(),
             KeyCode::Enter if self.selected.is_some() => {
                 self.sender
                     .dispatch(GlimEvent::PipelineActionsOpen(

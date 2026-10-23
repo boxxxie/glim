@@ -106,8 +106,20 @@ impl StatefulWidgets {
             GlimEvent::InputMouse(mouse) => self.handle_mouse_event(*mouse, app),
             GlimEvent::ProjectNext => self.handle_project_selection(1, app),
             GlimEvent::ProjectPrevious => self.handle_project_selection(-1, app),
+            GlimEvent::ProjectPageDown => self.handle_project_selection(5, app),
+            GlimEvent::ProjectPageUp => self.handle_project_selection(-5, app),
+            GlimEvent::ProjectFirst => self.handle_project_first(app),
             GlimEvent::ActivityNext => self.handle_activity_selection(1, app),
             GlimEvent::ActivityPrevious => self.handle_activity_selection(-1, app),
+            GlimEvent::ActivityPageDown => {
+                let page = self.activity_page_size();
+                self.handle_activity_selection(page, app);
+            },
+            GlimEvent::ActivityPageUp => {
+                let page = self.activity_page_size();
+                self.handle_activity_selection(-page, app);
+            },
+            GlimEvent::ActivityFirst => self.handle_activity_first(app),
             GlimEvent::FocusToggle => {
                 if self.show_activity_feed {
                     self.activity_feed_focused = !self.activity_feed_focused;
@@ -315,12 +327,9 @@ impl StatefulWidgets {
         }
 
         if let Some(current) = self.project_table_state.selected() {
-            let new_index = match direction {
-                1 => current.saturating_add(1),
-                -1 => current.saturating_sub(1),
-                n => panic!("invalid direction: {n}"),
-            }
-            .min(filtered_count.saturating_sub(1));
+            let new_index = current
+                .saturating_add_signed(direction as isize)
+                .min(filtered_count.saturating_sub(1));
 
             self.project_table_state.select(Some(new_index));
 
@@ -337,6 +346,28 @@ impl StatefulWidgets {
         } else {
             self.project_table_state.select(Some(0));
         }
+    }
+
+    fn handle_project_first(&mut self, app: &GlimApp) {
+        let all_projects = app.projects();
+        let filtered_count = if self.current_filtered_indices.is_empty() {
+            all_projects.len()
+        } else {
+            self.current_filtered_indices.len()
+        };
+        if filtered_count == 0 {
+            return;
+        }
+        *self.project_table_state.offset_mut() = 0;
+        self.project_table_state.select(Some(0));
+        let project_index = if self.current_filtered_indices.is_empty() {
+            0
+        } else {
+            self.current_filtered_indices[0]
+        };
+        let project = &all_projects[project_index];
+        self.selected_project_id = Some(project.id);
+        app.dispatch(GlimEvent::ProjectSelected(project.id));
     }
 
     pub fn handle_pipeline_selection(&mut self, direction: i32) {
@@ -365,6 +396,49 @@ impl StatefulWidgets {
         }
     }
 
+    pub fn handle_pipeline_page(&mut self, delta: i32) {
+        let Some(pd) = self.project_details.as_mut() else {
+            return;
+        };
+        let pipelines = pd
+            .project
+            .recent_pipelines(pd.max_recent_pipelines, pd.include_mr_pipelines);
+        if pipelines.is_empty() {
+            pd.pipelines_table_state.select(None);
+            pd.selected_pipeline_id = None;
+            return;
+        }
+        let current = pd.pipelines_table_state.selected().unwrap_or(0);
+        let new_index = current
+            .saturating_add_signed(delta as isize)
+            .min(pipelines.len() - 1);
+        pd.pipelines_table_state.select(Some(new_index));
+        let pipeline = &pipelines[new_index];
+        pd.selected_pipeline_id = Some(pipeline.id);
+        self.sender
+            .dispatch(GlimEvent::PipelineSelected(pipeline.id));
+    }
+
+    pub fn handle_pipeline_home(&mut self) {
+        let Some(pd) = self.project_details.as_mut() else {
+            return;
+        };
+        let pipelines = pd
+            .project
+            .recent_pipelines(pd.max_recent_pipelines, pd.include_mr_pipelines);
+        if pipelines.is_empty() {
+            pd.pipelines_table_state.select(None);
+            pd.selected_pipeline_id = None;
+            return;
+        }
+        *pd.pipelines_table_state.offset_mut() = 0;
+        pd.pipelines_table_state.select(Some(0));
+        let pipeline = &pipelines[0];
+        pd.selected_pipeline_id = Some(pipeline.id);
+        self.sender
+            .dispatch(GlimEvent::PipelineSelected(pipeline.id));
+    }
+
     pub fn handle_pipeline_action_selection(&mut self, direction: i32) {
         if self.pipeline_actions.is_none() {
             return;
@@ -377,6 +451,28 @@ impl StatefulWidgets {
             pipelines
                 .list_state
                 .select(Some(new_index as usize));
+        }
+    }
+
+    fn activity_page_size(&self) -> i32 {
+        self.last_feed_area
+            .map(|r| r.height.saturating_sub(2).max(1) as i32)
+            .unwrap_or(8)
+    }
+
+    pub fn handle_activity_first(&mut self, app: &GlimApp) {
+        let events = app.recent_activity();
+        if events.is_empty() {
+            self.activity_selected_index = None;
+            self.selected_activity_id = None;
+            return;
+        }
+        self.activity_selected_index = Some(0);
+        self.selected_activity_id = Some(events[0].id);
+        self.activity_feed_scroll = 0;
+        if let Some(ad) = self.activity_details.as_mut() {
+            let popup_area = ad.popup_area.clone();
+            *ad = ActivityDetailsPopupState::new(events[0].clone(), popup_area);
         }
     }
 
@@ -393,12 +489,9 @@ impl StatefulWidgets {
             .and_then(|id| events.iter().position(|e| e.id == id))
             .or(self.activity_selected_index)
             .unwrap_or(0);
-        let new_index = match direction {
-            1 => current.saturating_add(1),
-            -1 => current.saturating_sub(1),
-            _ => current,
-        }
-        .min(events.len().saturating_sub(1));
+        let new_index = current
+            .saturating_add_signed(direction as isize)
+            .min(events.len().saturating_sub(1));
 
         self.activity_selected_index = Some(new_index);
         self.selected_activity_id = Some(events[new_index].id);
