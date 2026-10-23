@@ -38,6 +38,7 @@ pub struct ProjectStore {
     hydrated_mrs: HashSet<ProjectId>,
     last_seen_event_id: HashMap<ProjectId, u64>,
     recent_activity: Vec<ProjectActivityEvent>,
+    startup_notified: bool,
 }
 
 impl ProjectStore {
@@ -59,11 +60,21 @@ impl ProjectStore {
             hydrated_mrs: HashSet::new(),
             last_seen_event_id: HashMap::new(),
             recent_activity: Vec::new(),
+            startup_notified: false,
         }
     }
 
     pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
         &self.recent_activity
+    }
+
+    pub fn notify_latest_activity(&self) {
+        if let Some(latest) = self.recent_activity.first() {
+            let (summary, body, urgency) = format_activity_notification(latest);
+            if self.os_notifications {
+                send_os_notification(&summary, &body, urgency);
+            }
+        }
     }
 
     fn emit_notification(&self, summary: &str, body: &str, urgency: NotifyUrgency) {
@@ -168,6 +179,7 @@ impl ProjectStore {
 
                 let is_hydrated = self.hydrated_pipelines.contains(&project_id);
                 let mut notifications: Vec<(String, String, NotifyUrgency)> = Vec::new();
+                let mut pipeline_feed_events: Vec<ProjectActivityEvent> = Vec::new();
 
                 if let Some(project) = self.find_mut(project_id) {
                     let project_title = project.title();
@@ -178,41 +190,106 @@ impl ProjectStore {
 
                     if is_hydrated {
                         if let Some(old_pipelines) = &project.pipelines {
+                            let max_old_id = old_pipelines
+                                .iter()
+                                .map(|op| op.id.value())
+                                .max()
+                                .unwrap_or(0);
+
                             for p in &new_pipelines {
+                                let mr_iid = project
+                                    .merge_request_for_branch(&p.branch)
+                                    .map(|mr| mr.iid);
+                                let mr_tag = mr_iid
+                                    .map(|iid| format!(" (!{})", iid))
+                                    .unwrap_or_default();
+
                                 if let Some(old_p) = old_pipelines.iter().find(|op| op.id == p.id) {
                                     if old_p.status != p.status {
-                                        let mr_tag = project
-                                            .merge_request_for_branch(&p.branch)
-                                            .map(|mr| format!(" (!{})", mr.iid))
-                                            .unwrap_or_default();
-                                        match p.status {
-                                            PipelineStatus::Failed => {
-                                                notifications.push((
-                                                    format!("🔴 [{}] Pipeline failed", project_title),
-                                                    format!("{}{}", p.branch, mr_tag),
-                                                    NotifyUrgency::Critical,
-                                                ));
-                                            },
-                                            PipelineStatus::Success if old_p.status.is_active() => {
-                                                notifications.push((
-                                                    format!("🟢 [{}] Pipeline passed", project_title),
+                                        let transition = match p.status {
+                                            PipelineStatus::Failed => Some((
+                                                format!("🔴 [{}] Pipeline failed", project_title),
+                                                format!("{}{}", p.branch, mr_tag),
+                                                NotifyUrgency::Critical,
+                                                "failed",
+                                            )),
+                                            PipelineStatus::Success => Some((
+                                                format!("🟢 [{}] Pipeline passed", project_title),
+                                                format!("{}{}", p.branch, mr_tag),
+                                                NotifyUrgency::Normal,
+                                                "passed",
+                                            )),
+                                            _ if !old_p.status.is_active()
+                                                && p.status.is_active() =>
+                                            {
+                                                Some((
+                                                    format!(
+                                                        "🔵 [{}] Pipeline running",
+                                                        project_title
+                                                    ),
                                                     format!("{}{}", p.branch, mr_tag),
                                                     NotifyUrgency::Normal,
-                                                ));
+                                                    "running",
+                                                ))
                                             },
-                                            _ => {},
+                                            _ => None,
+                                        };
+                                        if let Some((sum, body, urg, label)) = transition {
+                                            notifications.push((sum, body, urg));
+                                            pipeline_feed_events.push(ProjectActivityEvent {
+                                                id: p.id.value().wrapping_mul(1000)
+                                                    + (p.updated_at.timestamp() as u64 % 1000),
+                                                project_id,
+                                                project_name: project_title.clone(),
+                                                kind: ActivityKind::PipelineStatus,
+                                                author: "ci".into(),
+                                                mr_iid,
+                                                branch: Some(p.branch.clone()),
+                                                summary: format!("Pipeline #{} {}", p.id, label)
+                                                    .into(),
+                                                detail: None,
+                                                created_at: p.updated_at,
+                                            });
                                         }
                                     }
-                                } else if p.status == PipelineStatus::Failed {
-                                    let mr_tag = project
-                                        .merge_request_for_branch(&p.branch)
-                                        .map(|mr| format!(" (!{})", mr.iid))
-                                        .unwrap_or_default();
-                                    notifications.push((
-                                        format!("🔴 [{}] Pipeline failed", project_title),
-                                        format!("{}{}", p.branch, mr_tag),
-                                        NotifyUrgency::Critical,
-                                    ));
+                                } else if p.id.value() > max_old_id {
+                                    let transition = match p.status {
+                                        PipelineStatus::Failed => Some((
+                                            format!("🔴 [{}] Pipeline failed", project_title),
+                                            format!("{}{}", p.branch, mr_tag),
+                                            NotifyUrgency::Critical,
+                                            "failed",
+                                        )),
+                                        PipelineStatus::Success => Some((
+                                            format!("🟢 [{}] Pipeline passed", project_title),
+                                            format!("{}{}", p.branch, mr_tag),
+                                            NotifyUrgency::Normal,
+                                            "passed",
+                                        )),
+                                        _ if p.status.is_active() => Some((
+                                            format!("🔵 [{}] Pipeline started", project_title),
+                                            format!("{}{}", p.branch, mr_tag),
+                                            NotifyUrgency::Normal,
+                                            "started",
+                                        )),
+                                        _ => None,
+                                    };
+                                    if let Some((sum, body, urg, label)) = transition {
+                                        notifications.push((sum, body, urg));
+                                        pipeline_feed_events.push(ProjectActivityEvent {
+                                            id: p.id.value().wrapping_mul(1000)
+                                                + (p.updated_at.timestamp() as u64 % 1000),
+                                            project_id,
+                                            project_name: project_title.clone(),
+                                            kind: ActivityKind::PipelineStatus,
+                                            author: "ci".into(),
+                                            mr_iid,
+                                            branch: Some(p.branch.clone()),
+                                            summary: format!("Pipeline #{} {}", p.id, label).into(),
+                                            detail: None,
+                                            created_at: p.updated_at,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -226,6 +303,13 @@ impl ProjectStore {
                     project.update_pipelines(new_pipelines);
                     sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())))
                 }
+
+                for ev in pipeline_feed_events {
+                    self.recent_activity.push(ev);
+                }
+                self.recent_activity
+                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
 
                 self.hydrated_pipelines.insert(project_id);
                 for (summary, body, urgency) in notifications {
@@ -352,6 +436,16 @@ impl ProjectStore {
                 for ev in newly_arrived {
                     let (summary, body, urgency) = format_activity_notification(&ev);
                     self.emit_notification(&summary, &body, urgency);
+                }
+
+                // On first startup hydration, emit the single latest activity notification so the user
+                // sees immediate confirmation that in-app and OS notifications are active.
+                if !self.startup_notified {
+                    if let Some(latest) = self.recent_activity.first() {
+                        self.startup_notified = true;
+                        let (summary, body, urgency) = format_activity_notification(latest);
+                        self.emit_notification(&summary, &body, urgency);
+                    }
                 }
             },
 

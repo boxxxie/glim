@@ -10,7 +10,7 @@ pub struct ProjectId {
     value: u32,
 }
 
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub struct PipelineId {
     value: u32,
 }
@@ -24,6 +24,10 @@ impl ProjectId {
 impl PipelineId {
     pub fn new(id: u32) -> Self {
         Self { value: id }
+    }
+
+    pub fn value(self) -> u64 {
+        self.value as u64
     }
 }
 

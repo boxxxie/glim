@@ -315,6 +315,7 @@ impl GlimApp {
             },
 
             GlimEvent::NotificationLast => {
+                self.project_store.notify_latest_activity();
                 if let Some(notice) = self.notices.last_notification() {
                     let content_area = RefRect::new(Rect::default());
                     effects.register_notification_effect(content_area.clone());
