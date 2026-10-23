@@ -472,8 +472,9 @@ impl ProjectStore {
                 self.last_seen_todo_id = Some(max_todo_id);
 
                 let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                let current_username = self.current_username.clone();
                 for todo in todos {
-                    if let Some(activity) = convert_gitlab_todo(todo) {
+                    if let Some(activity) = convert_gitlab_todo(todo, &current_username) {
                         if let Some(prev_max) = prev_max_todo_id {
                             if todo.id > prev_max {
                                 newly_arrived.push(activity.clone());
@@ -598,11 +599,13 @@ pub fn convert_gitlab_event(
     let action = dto.action_name.as_str();
     let target_type = dto.target_type.as_deref().unwrap_or("");
 
+    let is_self = author.eq_ignore_ascii_case(current_username);
+
     match (action, target_type) {
         ("opened", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
-            let kind = if contains_mention(&title, current_username) {
+            let kind = if !is_self && contains_mention(&title, current_username) {
                 ActivityKind::Mention
             } else {
                 ActivityKind::MrOpened
@@ -670,7 +673,7 @@ pub fn convert_gitlab_event(
         },
         (a, _) if a.starts_with("commented") => {
             let note = dto.note.as_ref()?;
-            let is_mention = contains_mention(&note.body, current_username);
+            let is_mention = !is_self && contains_mention(&note.body, current_username);
             if !is_mention && note.noteable_type.as_deref() != Some("MergeRequest") {
                 return None;
             }
@@ -729,7 +732,13 @@ pub fn convert_gitlab_event(
     }
 }
 
-pub fn convert_gitlab_todo(todo: &GitlabTodoDto) -> Option<ProjectActivityEvent> {
+pub fn convert_gitlab_todo(
+    todo: &GitlabTodoDto,
+    current_username: &str,
+) -> Option<ProjectActivityEvent> {
+    if todo.author.username.eq_ignore_ascii_case(current_username) {
+        return None;
+    }
     let project = todo.project.as_ref()?;
     let project_name: CompactString = project
         .path_with_namespace
@@ -740,7 +749,6 @@ pub fn convert_gitlab_todo(todo: &GitlabTodoDto) -> Option<ProjectActivityEvent>
     let kind = match todo.action_name.as_str() {
         "mentioned" | "directly_addressed" => ActivityKind::Mention,
         "review_requested" | "approval_required" | "assigned" => ActivityKind::ReviewRequested,
-        "unmergeable" => ActivityKind::Mention,
         _ => return None,
     };
     let mr_iid = todo.target.as_ref().and_then(|t| t.iid);
