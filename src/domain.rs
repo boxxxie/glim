@@ -73,6 +73,8 @@ impl MergeRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ActivityKind {
+    Mention,
+    ReviewRequested,
     MrOpened,
     MrMerged,
     MrClosed,
@@ -85,6 +87,8 @@ pub enum ActivityKind {
 impl ActivityKind {
     pub fn icon(&self) -> &'static str {
         match self {
+            ActivityKind::Mention => "📣",
+            ActivityKind::ReviewRequested => "👀",
             ActivityKind::MrOpened => "🟣",
             ActivityKind::MrMerged => "🟢",
             ActivityKind::MrClosed => "🚫",
@@ -97,6 +101,8 @@ impl ActivityKind {
 
     pub fn action_label(&self) -> &'static str {
         match self {
+            ActivityKind::Mention => "mentioned you",
+            ActivityKind::ReviewRequested => "requested review",
             ActivityKind::MrOpened => "opened",
             ActivityKind::MrMerged => "merged",
             ActivityKind::MrClosed => "closed",
@@ -303,6 +309,79 @@ impl GitlabEventDto {
         }
         false
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct GitlabUserDto {
+    pub id: u64,
+    #[serde(default)]
+    pub username: CompactString,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct TodoProjectDto {
+    pub id: ProjectId,
+    #[serde(default)]
+    pub path_with_namespace: CompactString,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct TodoTargetDto {
+    pub iid: Option<u64>,
+    pub title: Option<CompactString>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct GitlabTodoDto {
+    pub id: u64,
+    #[serde(default)]
+    pub action_name: CompactString,
+    #[serde(default)]
+    pub target_type: CompactString,
+    #[serde(default)]
+    pub target_url: CompactString,
+    #[serde(default)]
+    pub body: CompactString,
+    #[serde(default)]
+    pub author: MergeRequestAuthorDto,
+    pub project: Option<TodoProjectDto>,
+    pub target: Option<TodoTargetDto>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Returns true if `text` contains `@username` (or `@all`) with a word boundary.
+pub fn contains_mention(text: &str, username: &str) -> bool {
+    if username.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let user_lower = username.to_lowercase();
+    for needle in [format!("@{user_lower}"), "@all".to_string()] {
+        let mut search_from = 0;
+        while let Some(pos) = lower[search_from..].find(&needle) {
+            let abs_pos = search_from + pos;
+            let after_pos = abs_pos + needle.len();
+            let valid_before = abs_pos == 0
+                || !lower[..abs_pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let valid_after = after_pos >= lower.len()
+                || !lower[after_pos..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
+            if valid_before && valid_after {
+                return true;
+            }
+            search_from = after_pos;
+        }
+    }
+    false
 }
 
 /// Strip HTML tags, comments, and collapse whitespace for clean 1-line comment previews.

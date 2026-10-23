@@ -59,6 +59,15 @@ impl GitlabService {
                     "Successfully fetched projects"
                 );
                 self.sender.dispatch(projects.into_glim_event());
+                if let Ok(user) = self.api.get_current_user().await {
+                    if !user.username.is_empty() {
+                        self.sender
+                            .dispatch(GlimEvent::CurrentUserLoaded(user.username));
+                    }
+                }
+                if let Ok(todos) = self.api.get_todos().await {
+                    self.sender.dispatch(GlimEvent::TodosLoaded(todos));
+                }
                 Ok(())
             },
             Err(e) => {

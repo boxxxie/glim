@@ -13,7 +13,10 @@ use super::{
     error::{ClientError, Result},
 };
 use crate::{
-    domain::{GitlabEventDto, JobDto, MergeRequestDto, PipelineDto, ProjectDto},
+    domain::{
+        GitlabEventDto, GitlabTodoDto, GitlabUserDto, JobDto, MergeRequestDto, PipelineDto,
+        ProjectDto,
+    },
     id::{JobId, PipelineId, ProjectId},
 };
 
@@ -154,6 +157,26 @@ impl GitlabApi {
                 config.base_url,
                 project_id
             )
+        };
+        self.get_json(&url).await
+    }
+
+    /// Get the currently authenticated GitLab user
+    #[instrument(skip(self))]
+    pub async fn get_current_user(&self) -> Result<GitlabUserDto> {
+        let url = {
+            let config = self.config.read().unwrap();
+            format_compact!("{}/user", config.base_url)
+        };
+        self.get_json(&url).await
+    }
+
+    /// Get pending GitLab Todos (mentions, review requests, assignments, build failures)
+    #[instrument(skip(self))]
+    pub async fn get_todos(&self) -> Result<Vec<GitlabTodoDto>> {
+        let url = {
+            let config = self.config.read().unwrap();
+            format_compact!("{}/todos?per_page=25", config.base_url)
         };
         self.get_json(&url).await
     }

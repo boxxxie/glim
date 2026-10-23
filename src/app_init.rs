@@ -32,13 +32,7 @@ pub async fn initialize_app(
 ) -> Result<AppComponents> {
     color_eyre::install().expect("failed to install color_eyre");
 
-    let any_shader_fx = config.animations
-        && (config.glitch_effect
-            || config.table_sweep_effect
-            || config.popup_effects
-            || config.notification_effects);
-    let tick_ms = if any_shader_fx { 33 } else { 250 };
-    let event_handler = EventHandler::new(std::time::Duration::from_millis(tick_ms));
+    let event_handler = EventHandler::new(std::time::Duration::from_millis(33));
     let sender = event_handler.sender();
 
     let (log_guard, log_reload_handle) = initialize_logging(sender.clone(), &config)?;

@@ -29,6 +29,10 @@ impl Tui {
         Self { terminal, events }
     }
 
+    pub fn set_fast_tick(&self, enabled: bool) {
+        self.events.set_fast_tick(enabled);
+    }
+
     pub fn draw(&mut self, render_ui: impl FnOnce(&mut Frame)) -> Result<(), GlimError> {
         self.terminal
             .draw(render_ui)

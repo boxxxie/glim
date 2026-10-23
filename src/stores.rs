@@ -11,8 +11,8 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     dispatcher::Dispatcher,
     domain::{
-        clean_note_body, ActivityKind, GitlabEventDto, Job, MergeRequest, Pipeline, PipelineStatus,
-        Project, ProjectActivityEvent,
+        clean_note_body, contains_mention, ActivityKind, GitlabEventDto, GitlabTodoDto, Job,
+        MergeRequest, Pipeline, PipelineStatus, Project, ProjectActivityEvent,
     },
     event::GlimEvent,
     glim_app::GlimConfig,
@@ -37,6 +37,8 @@ pub struct ProjectStore {
     hydrated_pipelines: HashSet<ProjectId>,
     hydrated_mrs: HashSet<ProjectId>,
     last_seen_event_id: HashMap<ProjectId, u64>,
+    last_seen_todo_id: Option<u64>,
+    current_username: CompactString,
     recent_activity: Vec<ProjectActivityEvent>,
     startup_notified: bool,
 }
@@ -59,6 +61,8 @@ impl ProjectStore {
             hydrated_pipelines: HashSet::new(),
             hydrated_mrs: HashSet::new(),
             last_seen_event_id: HashMap::new(),
+            last_seen_todo_id: None,
+            current_username: "paul".into(),
             recent_activity: Vec::new(),
             startup_notified: false,
         }
@@ -410,12 +414,15 @@ impl ProjectStore {
                 };
 
                 let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                let current_username = self.current_username.clone();
 
                 for dto in event_dtos {
                     if self.ignore_bot_comments && dto.is_bot_event() {
                         continue;
                     }
-                    if let Some(activity) = convert_gitlab_event(dto, &project) {
+                    if let Some(activity) =
+                        convert_gitlab_event(dto, &project, &current_username)
+                    {
                         if let Some(prev_max) = prev_max_id {
                             if activity.id > prev_max {
                                 newly_arrived.push(activity.clone());
@@ -446,6 +453,50 @@ impl ProjectStore {
                         let (summary, body, urgency) = format_activity_notification(latest);
                         self.emit_notification(&summary, &body, urgency);
                     }
+                }
+            },
+
+            GlimEvent::CurrentUserLoaded(username) => {
+                debug!(username = %username, "Authenticated GitLab user loaded");
+                self.current_username = username.clone();
+            },
+
+            GlimEvent::TodosLoaded(todos) => {
+                debug!(todo_count = todos.len(), "Processing GitLab todos");
+                let prev_max_todo_id = self.last_seen_todo_id;
+                let max_todo_id = todos
+                    .iter()
+                    .map(|t| t.id)
+                    .max()
+                    .unwrap_or(prev_max_todo_id.unwrap_or(0));
+                self.last_seen_todo_id = Some(max_todo_id);
+
+                let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                for todo in todos {
+                    if let Some(activity) = convert_gitlab_todo(todo) {
+                        if let Some(prev_max) = prev_max_todo_id {
+                            if todo.id > prev_max {
+                                newly_arrived.push(activity.clone());
+                            }
+                        }
+                        if !self
+                            .recent_activity
+                            .iter()
+                            .any(|existing| existing.id == activity.id)
+                        {
+                            self.recent_activity.push(activity);
+                        }
+                    }
+                }
+
+                self.recent_activity
+                    .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                self.recent_activity.truncate(MAX_ACTIVITY_EVENTS);
+
+                newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                for ev in newly_arrived {
+                    let (summary, body, urgency) = format_activity_notification(&ev);
+                    self.emit_notification(&summary, &body, urgency);
                 }
             },
 
@@ -540,6 +591,7 @@ impl ProjectStore {
 pub fn convert_gitlab_event(
     dto: &GitlabEventDto,
     project: &Project,
+    current_username: &str,
 ) -> Option<ProjectActivityEvent> {
     let project_name = project.title();
     let author = dto.author_username.clone();
@@ -550,11 +602,16 @@ pub fn convert_gitlab_event(
         ("opened", "MergeRequest") => {
             let mr_iid = dto.target_iid;
             let title = dto.target_title.clone().unwrap_or_default();
+            let kind = if contains_mention(&title, current_username) {
+                ActivityKind::Mention
+            } else {
+                ActivityKind::MrOpened
+            };
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
                 project_name,
-                kind: ActivityKind::MrOpened,
+                kind,
                 author,
                 mr_iid,
                 branch: None,
@@ -613,7 +670,8 @@ pub fn convert_gitlab_event(
         },
         (a, _) if a.starts_with("commented") => {
             let note = dto.note.as_ref()?;
-            if note.noteable_type.as_deref() != Some("MergeRequest") {
+            let is_mention = contains_mention(&note.body, current_username);
+            if !is_mention && note.noteable_type.as_deref() != Some("MergeRequest") {
                 return None;
             }
             let mr_iid = note.noteable_iid.or(dto.target_iid);
@@ -622,11 +680,16 @@ pub fn convert_gitlab_event(
                 return None;
             }
             let mr_title = dto.target_title.clone();
+            let kind = if is_mention {
+                ActivityKind::Mention
+            } else {
+                ActivityKind::MrComment
+            };
             Some(ProjectActivityEvent {
                 id: dto.id,
                 project_id: project.id,
                 project_name,
-                kind: ActivityKind::MrComment,
+                kind,
                 author,
                 mr_iid,
                 branch: None,
@@ -666,6 +729,42 @@ pub fn convert_gitlab_event(
     }
 }
 
+pub fn convert_gitlab_todo(todo: &GitlabTodoDto) -> Option<ProjectActivityEvent> {
+    let project = todo.project.as_ref()?;
+    let project_name: CompactString = project
+        .path_with_namespace
+        .rsplit('/')
+        .next()
+        .unwrap_or(&project.path_with_namespace)
+        .into();
+    let kind = match todo.action_name.as_str() {
+        "mentioned" | "directly_addressed" => ActivityKind::Mention,
+        "review_requested" | "approval_required" | "assigned" => ActivityKind::ReviewRequested,
+        "unmergeable" => ActivityKind::Mention,
+        _ => return None,
+    };
+    let mr_iid = todo.target.as_ref().and_then(|t| t.iid);
+    let target_title = todo.target.as_ref().and_then(|t| t.title.clone());
+    let snippet = clean_note_body(&todo.body, 90);
+    let summary = if !snippet.is_empty() {
+        snippet
+    } else {
+        target_title.clone().unwrap_or_else(|| todo.action_name.clone())
+    };
+    Some(ProjectActivityEvent {
+        id: todo.id + 1_000_000_000,
+        project_id: project.id,
+        project_name,
+        kind,
+        author: todo.author.username.clone(),
+        mr_iid,
+        branch: None,
+        summary,
+        detail: target_title,
+        created_at: todo.created_at,
+    })
+}
+
 fn format_activity_notification(
     ev: &ProjectActivityEvent,
 ) -> (String, String, NotifyUrgency) {
@@ -684,7 +783,11 @@ fn format_activity_notification(
         mr_ref
     );
     let body = ev.summary.to_string();
-    (summary, body, NotifyUrgency::Normal)
+    let urgency = match ev.kind {
+        ActivityKind::Mention | ActivityKind::ReviewRequested => NotifyUrgency::Critical,
+        _ => NotifyUrgency::Normal,
+    };
+    (summary, body, urgency)
 }
 
 fn is_older_than_days(date: DateTime<Utc>, days: i64) -> bool {
@@ -837,11 +940,36 @@ mod tests {
         assert!(!human_comment.is_bot_event());
 
         let project = sample_project();
-        let activity = convert_gitlab_event(&human_comment, &project).unwrap();
+        let activity = convert_gitlab_event(&human_comment, &project, "paul").unwrap();
         assert_eq!(activity.kind, ActivityKind::MrComment);
         assert_eq!(activity.mr_iid, Some(61));
         assert_eq!(activity.author, "saad");
         assert_eq!(activity.summary, "Looks great, let's merge after CI passes!");
+
+        let mention_comment = GitlabEventDto {
+            id: 2891,
+            project_id: ProjectId::new(24),
+            action_name: "commented on".into(),
+            target_type: Some("DiscussionNote".into()),
+            target_iid: Some(3011),
+            target_title: Some("Emails 6".into()),
+            author_username: "saad".into(),
+            created_at: Utc::now(),
+            note: Some(GitlabEventNoteDto {
+                id: 3011,
+                body: "Hey @paul can you take a look at this migration?".into(),
+                noteable_type: Some("MergeRequest".into()),
+                noteable_iid: Some(61),
+                system: false,
+            }),
+            push_data: None,
+        };
+        let mention_activity = convert_gitlab_event(&mention_comment, &project, "paul").unwrap();
+        assert_eq!(mention_activity.kind, ActivityKind::Mention);
+        let (_, _, urgency) = format_activity_notification(&mention_activity);
+        assert!(matches!(urgency, NotifyUrgency::Critical));
+        assert!(contains_mention("cc @paul!", "paul"));
+        assert!(!contains_mention("cc @paulina", "paul"));
     }
 
     #[test]

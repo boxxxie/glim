@@ -1,4 +1,11 @@
-use std::{fmt::Debug, sync::mpsc, thread};
+use std::{
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+};
 
 use compact_str::CompactString;
 use crossterm::event::{
@@ -8,7 +15,9 @@ use tracing::Level;
 
 use crate::{
     dispatcher::Dispatcher,
-    domain::{GitlabEventDto, JobDto, MergeRequestDto, PipelineDto, Project, ProjectDto},
+    domain::{
+        GitlabEventDto, GitlabTodoDto, JobDto, MergeRequestDto, PipelineDto, Project, ProjectDto,
+    },
     glim_app::GlimConfig,
     id::{JobId, PipelineId, ProjectId},
     result,
@@ -25,6 +34,7 @@ pub enum GlimEvent {
     ConfigClose,
     ConfigOpen,
     ConfigUpdate(GlimConfig),
+    CurrentUserLoaded(CompactString),
     FilterClear,
     FilterInputBackspace,
     FilterInputChar(CompactString),
@@ -68,6 +78,7 @@ pub enum GlimEvent {
     ProjectsLoaded(Vec<ProjectDto>),
     ScreenCapture,
     ScreenCaptureToClipboard(String),
+    TodosLoaded(Vec<GitlabTodoDto>),
     ToggleActivityFeed,
 }
 
@@ -84,6 +95,7 @@ impl GlimEvent {
             GlimEvent::ConfigClose => "ConfigClose",
             GlimEvent::ConfigOpen => "ConfigOpen",
             GlimEvent::ConfigUpdate(_) => "ConfigUpdate",
+            GlimEvent::CurrentUserLoaded(_) => "CurrentUserLoaded",
             GlimEvent::FilterClear => "FilterClear",
             GlimEvent::FilterInputBackspace => "FilterInputBackspace",
             GlimEvent::FilterInputChar(_) => "FilterInputChar",
@@ -125,6 +137,7 @@ impl GlimEvent {
             GlimEvent::ProjectsLoaded(_) => "ProjectsLoaded",
             GlimEvent::ScreenCapture => "ScreenCapture",
             GlimEvent::ScreenCaptureToClipboard(_) => "ScreenCaptureToClipboard",
+            GlimEvent::TodosLoaded(_) => "TodosLoaded",
             GlimEvent::ToggleActivityFeed => "ToggleActivityFeed",
         }
     }
@@ -142,6 +155,7 @@ pub enum GlitchState {
 pub struct EventHandler {
     sender: mpsc::Sender<GlimEvent>,
     receiver: mpsc::Receiver<GlimEvent>,
+    fast_tick: Arc<AtomicBool>,
     _handler: thread::JoinHandle<()>,
 }
 
@@ -152,21 +166,29 @@ pub trait IntoGlimEvent {
 impl EventHandler {
     pub fn new(tick_rate: std::time::Duration) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let fast_tick = Arc::new(AtomicBool::new(false));
 
         let handler = {
             let sender = sender.clone();
+            let fast_tick = Arc::clone(&fast_tick);
             thread::spawn(move || {
                 let mut last_tick = std::time::Instant::now();
                 loop {
-                    let timeout = tick_rate
+                    let current_rate = if fast_tick.load(Ordering::Relaxed) {
+                        tick_rate
+                    } else {
+                        std::time::Duration::from_secs(15)
+                    };
+                    let timeout = current_rate
                         .checked_sub(last_tick.elapsed())
-                        .unwrap_or(tick_rate);
+                        .unwrap_or(std::time::Duration::ZERO)
+                        .min(std::time::Duration::from_millis(50));
 
                     if event::poll(timeout).expect("unable to poll for events") {
                         Self::apply_event(&sender);
                     }
 
-                    if last_tick.elapsed() >= tick_rate {
+                    if last_tick.elapsed() >= current_rate {
                         sender.dispatch(GlimEvent::AppTick);
                         last_tick = std::time::Instant::now();
                     }
@@ -174,7 +196,11 @@ impl EventHandler {
             })
         };
 
-        Self { sender, receiver, _handler: handler }
+        Self { sender, receiver, fast_tick, _handler: handler }
+    }
+
+    pub fn set_fast_tick(&self, enabled: bool) {
+        self.fast_tick.store(enabled, Ordering::Relaxed);
     }
 
     pub fn sender(&self) -> mpsc::Sender<GlimEvent> {

@@ -36,7 +36,14 @@
 //! // registry.process_effects(duration, buffer, screen_area);
 //! ```
 
-use std::{fmt::Debug, sync::mpsc::Sender};
+use std::{
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
+};
 
 use ratatui::{
     buffer::Buffer,
@@ -50,6 +57,7 @@ use tachyonfx::{
 };
 
 use crate::{
+    dispatcher::Dispatcher,
     event::{GlimEvent, GlitchState},
     gruvbox::Gruvbox::{Dark0, Dark0Hard, Dark3},
 };
@@ -111,6 +119,12 @@ pub struct EffectRegistry {
     popup_effects_enabled: bool,
     /// Whether notification banner scramble/blink effects are enabled
     notification_effects_enabled: bool,
+    /// Remaining duration (ms) of active finite effects
+    active_remaining_ms: u32,
+    /// Count of open popups with active background-dimming shader
+    open_popups: u8,
+    /// Sequence counter for non-animated notification auto-dismiss timers
+    notification_seq: Arc<AtomicU64>,
 }
 
 impl EffectRegistry {
@@ -133,6 +147,9 @@ impl EffectRegistry {
             table_sweep_enabled: true,
             popup_effects_enabled: true,
             notification_effects_enabled: true,
+            active_remaining_ms: 0,
+            open_popups: 0,
+            notification_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -193,7 +210,19 @@ impl EffectRegistry {
     /// * `buf` - Mutable reference to the terminal buffer to render into
     /// * `area` - The screen area to render effects within
     pub fn process_effects(&mut self, duration: Duration, buf: &mut Buffer, area: Rect) {
-        self.effects.process_effects(duration, buf, area);
+        self.active_remaining_ms = self
+            .active_remaining_ms
+            .saturating_sub(duration.as_millis());
+        if self.is_running() {
+            self.effects.process_effects(duration, buf, area);
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.animations_enabled
+            && (self.glitch_effect_enabled
+                || (self.popup_effects_enabled && self.open_popups > 0)
+                || self.active_remaining_ms > 0)
     }
 
     /// Creates a table fade-in effect for the projects table.
@@ -226,6 +255,7 @@ impl EffectRegistry {
         ])
         .with_filter(filter);
 
+        self.active_remaining_ms = self.active_remaining_ms.max(600);
         self.effects.add_effect(fx);
     }
 
@@ -243,18 +273,17 @@ impl EffectRegistry {
     /// - **Inactive**: Falls back to default low-intensity glitch
     /// - **RampedUp**: Higher intensity with more frequent glitch bursts
     pub fn register_glitch_effect(&mut self, glitch_state: GlitchState) {
-        let fx = if self.animations_enabled && self.glitch_effect_enabled {
-            match glitch_state {
-                GlitchState::Normal => default_glitch_effect(),
-                GlitchState::RampedUp => Glitch::builder()
-                    .action_ms(100..200)
-                    .action_start_delay_ms(0..500)
-                    .cell_glitch_ratio(0.05)
-                    .build()
-                    .into_effect(),
-            }
-        } else {
-            consume_tick()
+        if !self.animations_enabled || !self.glitch_effect_enabled {
+            return;
+        }
+        let fx = match glitch_state {
+            GlitchState::Normal => default_glitch_effect(),
+            GlitchState::RampedUp => Glitch::builder()
+                .action_ms(100..200)
+                .action_start_delay_ms(0..500)
+                .cell_glitch_ratio(0.05)
+                .build()
+                .into_effect(),
         };
 
         self.add_unique(FxId::Glitch, fx);
@@ -312,7 +341,6 @@ impl EffectRegistry {
     /// * `popup_area` - Reference to the popup's screen area
     fn register_popup(&mut self, id: FxId, popup_area: RefRect) {
         if !self.animations_enabled || !self.popup_effects_enabled {
-            self.add_unique(id, consume_tick());
             return;
         }
 
@@ -321,6 +349,7 @@ impl EffectRegistry {
             dim_screen_behind_popup(self.screen_area(), popup_area),
         ]);
 
+        self.open_popups = self.open_popups.saturating_add(1);
         self.add_unique(id, fx);
     }
 
@@ -332,12 +361,13 @@ impl EffectRegistry {
     ///
     /// * `id` - Unique identifier for the popup to close
     fn register_close_popup(&mut self, id: FxId) {
+        self.open_popups = self.open_popups.saturating_sub(1);
         if !self.animations_enabled || !self.popup_effects_enabled {
-            self.add_unique(id, consume_tick());
             return;
         }
 
         let fx = fade_from(Dark3, Dark0Hard, (300, Interpolation::CircIn));
+        self.active_remaining_ms = self.active_remaining_ms.max(350);
         self.add_unique(id, fx);
     }
 
@@ -359,11 +389,15 @@ impl EffectRegistry {
     /// 5. Dispatch close notification event
     pub fn register_notification_effect(&mut self, content_area: RefRect) {
         if !self.animations_enabled || !self.notification_effects_enabled {
-            let fx = sequence(&[
-                sleep(Duration::from_millis(5000)),
-                self.dispatch(GlimEvent::NotificationDismiss),
-            ]);
-            self.add_unique(FxId::Notification, fx);
+            let seq = self.notification_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let seq_ref = self.notification_seq.clone();
+            let sender = self.sender.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if seq_ref.load(Ordering::Relaxed) == seq {
+                    sender.dispatch(GlimEvent::NotificationDismiss);
+                }
+            });
             return;
         }
         use tachyonfx::Interpolation::{SineIn, SineOut};
@@ -399,6 +433,7 @@ impl EffectRegistry {
             self.dispatch(GlimEvent::NotificationDismiss),
         ]);
 
+        self.active_remaining_ms = self.active_remaining_ms.max(7000);
         self.add_unique(FxId::Notification, fx);
     }
 

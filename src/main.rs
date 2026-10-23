@@ -89,6 +89,7 @@ fn main() -> Result<()> {
             app.apply(event, &mut widget_states, &mut effects);
         });
         tui.draw(|f| render_main_ui(f, &app, &mut widget_states, &mut effects))?;
+        tui.set_fast_tick(effects.is_running());
     }
 
     tui.exit()?;
