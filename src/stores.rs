@@ -130,10 +130,7 @@ impl ProjectStore {
         }
     }
 
-    fn should_watch_project(&self, project: &Project) -> bool {
-        if is_older_than_days(project.last_activity(), self.auto_fetch_days) {
-            return false;
-        }
+    fn should_paginate_project(&self, project: &Project) -> bool {
         let path_lower = project.path.to_lowercase();
 
         if let Some(excludes) = &self.exclude_projects {
@@ -159,6 +156,13 @@ impl ProjectStore {
         }
 
         true
+    }
+
+    fn should_watch_project(&self, project: &Project) -> bool {
+        if is_older_than_days(project.last_activity(), self.auto_fetch_days) {
+            return false;
+        }
+        self.should_paginate_project(project)
     }
 
     #[instrument(skip(self, event), fields(event_type = %event.variant_name()))]
@@ -539,7 +543,7 @@ impl ProjectStore {
                 let candidate_ids: Vec<ProjectId> = self
                     .projects
                     .iter()
-                    .filter(|p| self.should_watch_project(p))
+                    .filter(|p| self.should_paginate_project(p))
                     .map(|p| p.id)
                     .filter(|id| {
                         !self.exhausted_events.contains(id)
@@ -603,7 +607,7 @@ impl ProjectStore {
                     self.recent_activity
                         .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                     self.save_activity_cache();
-                } else if event_dtos.len() >= 100 && *page < 20 {
+                } else if event_dtos.len() >= 100 && *page < 50 {
                     // All events on this page were already cached locally; advance to the next page
                     let next_page = page + 1;
                     self.loading_more_events.insert(*project_id);
@@ -828,6 +832,7 @@ impl ProjectStore {
 
         let cached_events: Vec<ProjectActivityEvent> =
             read_jsonl(&dir.join("activity_events.jsonl"));
+        let mut cached_event_counts: HashMap<ProjectId, usize> = HashMap::new();
         for mut ev in cached_events {
             if let Some(ref sha) = ev.commit_sha {
                 if let Some(commit) = self.commits.get(sha) {
@@ -847,6 +852,7 @@ impl ProjectStore {
                 } else if ev.id < 1_000_000_000 {
                     let entry = self.last_seen_event_id.entry(ev.project_id).or_insert(0);
                     *entry = (*entry).max(ev.id);
+                    *cached_event_counts.entry(ev.project_id).or_insert(0) += 1;
                 }
             }
             if !self
@@ -856,6 +862,10 @@ impl ProjectStore {
             {
                 self.recent_activity.push(ev);
             }
+        }
+        for (project_id, count) in cached_event_counts {
+            let start_page = ((count / 100) as u32).saturating_add(1).max(2);
+            self.next_events_page.insert(project_id, start_page);
         }
         if !self.recent_activity.is_empty() {
             self.recent_activity
@@ -1525,5 +1535,94 @@ mod tests {
         assert_eq!(reloaded.recent_activity()[0].summary, "Cached comment body");
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_activity_load_more_pagination_and_skip_cached() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut config = GlimConfig::default();
+        config.os_notifications = false;
+
+        let mut store = ProjectStore::with_cache_dir(tx, &config, None);
+        let dto = ProjectDto {
+            id: ProjectId::new(24),
+            path_with_namespace: "caasa/connect".into(),
+            description: None,
+            default_branch: "master".into(),
+            ssh_url_to_repo: "git@gitlab.nvestiv.com:caasa/connect.git".into(),
+            web_url: "https://gitlab.nvestiv.com/caasa/connect".into(),
+            last_activity_at: Utc::now(),
+            statistics: StatisticsDto::default(),
+        };
+        store.apply(&GlimEvent::ProjectsLoaded(vec![dto]));
+
+        // Simulate 100 events loaded on page 1
+        let page1_events: Vec<GitlabEventDto> = (1..=100)
+            .map(|i| GitlabEventDto {
+                id: 5000 + i,
+                project_id: ProjectId::new(24),
+                action_name: "opened".into(),
+                target_type: Some("MergeRequest".into()),
+                target_iid: Some(i),
+                target_title: Some(format!("MR {i}").into()),
+                author_username: "saad".into(),
+                created_at: Utc::now(),
+                note: None,
+                push_data: None,
+            })
+            .collect();
+        store.apply(&GlimEvent::ProjectEventsLoaded(
+            ProjectId::new(24),
+            page1_events.clone(),
+        ));
+        assert_eq!(store.recent_activity().len(), 100);
+        while rx.try_recv().is_ok() {}
+
+        // Request loading more events -> should dispatch ProjectEventsPageFetch(24, 2)
+        store.apply(&GlimEvent::ActivityLoadMore);
+        assert!(store.is_loading_more_activity());
+        let mut fetched_pages = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let GlimEvent::ProjectEventsPageFetch(pid, page) = ev {
+                fetched_pages.push((pid, page));
+            }
+        }
+        assert_eq!(fetched_pages, vec![(ProjectId::new(24), 2)]);
+
+        // If page 2 only has already-cached events (or bot events), it should automatically advance to page 3
+        store.apply(&GlimEvent::ProjectEventsPageLoaded(
+            ProjectId::new(24),
+            2,
+            page1_events,
+        ));
+        assert!(store.is_loading_more_activity());
+        let mut next_pages = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let GlimEvent::ProjectEventsPageFetch(pid, page) = ev {
+                next_pages.push((pid, page));
+            }
+        }
+        assert_eq!(next_pages, vec![(ProjectId::new(24), 3)]);
+
+        // When page 3 returns < 100 events, project is marked exhausted
+        let page3_events = vec![GitlabEventDto {
+            id: 4001,
+            project_id: ProjectId::new(24),
+            action_name: "opened".into(),
+            target_type: Some("MergeRequest".into()),
+            target_iid: Some(999),
+            target_title: Some("Older MR".into()),
+            author_username: "saad".into(),
+            created_at: Utc::now(),
+            note: None,
+            push_data: None,
+        }];
+        store.apply(&GlimEvent::ProjectEventsPageLoaded(
+            ProjectId::new(24),
+            3,
+            page3_events,
+        ));
+        assert!(!store.is_loading_more_activity());
+        assert_eq!(store.recent_activity().len(), 101);
     }
 }

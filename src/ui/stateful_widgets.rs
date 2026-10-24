@@ -126,9 +126,11 @@ impl StatefulWidgets {
                 if self.show_activity_feed {
                     self.activity_feed_focused = !self.activity_feed_focused;
                     if self.activity_feed_focused && self.selected_activity_id.is_none() {
-                        if let Some(first) = app.recent_activity().first() {
-                            self.activity_selected_index = Some(0);
-                            self.selected_activity_id = Some(first.id);
+                        let events = app.recent_activity();
+                        if !events.is_empty() {
+                            let idx = self.activity_feed_scroll.min(events.len() - 1);
+                            self.activity_selected_index = Some(idx);
+                            self.selected_activity_id = Some(events[idx].id);
                         }
                     }
                 } else {
@@ -672,6 +674,20 @@ impl StatefulWidgets {
                             self.handle_activity_selection(-1, app);
                         } else {
                             self.activity_feed_scroll = self.activity_feed_scroll.saturating_sub(1);
+                            if let Some(feed_rect) = self.last_feed_area {
+                                let visible_rows = feed_rect.height.saturating_sub(2).max(1) as usize;
+                                if let Some(sel_idx) = self.activity_selected_index {
+                                    let max_vis = self.activity_feed_scroll + visible_rows.saturating_sub(1);
+                                    if sel_idx > max_vis {
+                                        let events = app.recent_activity();
+                                        let clamped = max_vis.min(events.len().saturating_sub(1));
+                                        self.activity_selected_index = Some(clamped);
+                                        if let Some(ev) = events.get(clamped) {
+                                            self.selected_activity_id = Some(ev.id);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else {
                         self.handle_project_selection(-1, app);
@@ -690,14 +706,24 @@ impl StatefulWidgets {
                         if self.activity_feed_focused {
                             self.handle_activity_selection(1, app);
                         } else {
-                            let total = app.recent_activity().len();
-                            let max_scroll = total.saturating_sub(1);
-                            self.activity_feed_scroll =
-                                (self.activity_feed_scroll + 1).min(max_scroll);
+                            let events = app.recent_activity();
+                            let total = events.len();
                             let visible_rows = self
                                 .last_feed_area
                                 .map(|r| r.height.saturating_sub(2).max(1) as usize)
                                 .unwrap_or(8);
+                            let max_scroll = total.saturating_sub(visible_rows);
+                            self.activity_feed_scroll =
+                                (self.activity_feed_scroll + 1).min(max_scroll);
+                            if let Some(sel_idx) = self.activity_selected_index {
+                                if sel_idx < self.activity_feed_scroll {
+                                    let clamped = self.activity_feed_scroll.min(total.saturating_sub(1));
+                                    self.activity_selected_index = Some(clamped);
+                                    if let Some(ev) = events.get(clamped) {
+                                        self.selected_activity_id = Some(ev.id);
+                                    }
+                                }
+                            }
                             if self.activity_feed_scroll + visible_rows + 5 >= total {
                                 self.sender.dispatch(GlimEvent::ActivityLoadMore);
                             }

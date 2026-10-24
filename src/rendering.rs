@@ -144,17 +144,24 @@ fn render_projects_table(
                 widget_states.selected_activity_id = Some(events[clamped].id);
             }
         } else if widget_states.activity_feed_focused {
-            widget_states.activity_selected_index = Some(0);
-            widget_states.selected_activity_id = Some(events[0].id);
+            let idx = widget_states.activity_feed_scroll.min(events.len() - 1);
+            widget_states.activity_selected_index = Some(idx);
+            widget_states.selected_activity_id = Some(events[idx].id);
         }
 
-        if let Some(sel_idx) = widget_states.activity_selected_index {
-            let visible_rows = feed_area.height.saturating_sub(2).max(1) as usize;
-            if sel_idx < widget_states.activity_feed_scroll {
-                widget_states.activity_feed_scroll = sel_idx;
-            } else if sel_idx >= widget_states.activity_feed_scroll + visible_rows {
-                widget_states.activity_feed_scroll = sel_idx + 1 - visible_rows;
+        if widget_states.activity_feed_focused {
+            if let Some(sel_idx) = widget_states.activity_selected_index {
+                let visible_rows = feed_area.height.saturating_sub(2).max(1) as usize;
+                if sel_idx < widget_states.activity_feed_scroll {
+                    widget_states.activity_feed_scroll = sel_idx;
+                } else if sel_idx >= widget_states.activity_feed_scroll + visible_rows {
+                    widget_states.activity_feed_scroll = sel_idx + 1 - visible_rows;
+                }
             }
+        } else if !events.is_empty() {
+            let visible_rows = feed_area.height.saturating_sub(2).max(1) as usize;
+            let max_scroll = events.len().saturating_sub(visible_rows);
+            widget_states.activity_feed_scroll = widget_states.activity_feed_scroll.min(max_scroll);
         }
 
         let activity = ActivityFeed::new(
