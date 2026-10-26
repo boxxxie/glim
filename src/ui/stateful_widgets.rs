@@ -47,6 +47,7 @@ pub enum ClickAction {
 #[derive(Clone, Debug)]
 pub struct ClickRegion {
     pub area: Rect,
+    pub hover_area: Option<Rect>,
     pub action: ClickAction,
 }
 
@@ -70,6 +71,7 @@ pub struct StatefulWidgets {
     pub selected_activity_id: Option<u64>,
     pub activity_feed_scroll: usize,
     pub last_feed_area: Option<Rect>,
+    pub mouse_position: Option<Position>,
     pub click_regions: Vec<ClickRegion>,
     current_filtered_indices: Vec<usize>,
 }
@@ -96,6 +98,7 @@ impl StatefulWidgets {
             selected_activity_id: None,
             activity_feed_scroll: 0,
             last_feed_area: None,
+            mouse_position: None,
             click_regions: Vec::new(),
             current_filtered_indices: Vec::new(),
         }
@@ -660,7 +663,9 @@ impl StatefulWidgets {
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent, app: &GlimApp) {
         let pos = Position::new(mouse.column, mouse.row);
+        self.mouse_position = Some(pos);
         match mouse.kind {
+            MouseEventKind::Moved => {},
             MouseEventKind::ScrollUp => {
                 if self.activity_details.is_some() {
                     self.handle_activity_action_selection(-1);

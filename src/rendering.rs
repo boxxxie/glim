@@ -1,6 +1,7 @@
 use ratatui::{
     layout::{Constraint, Layout, Margin},
     prelude::{Direction, Rect},
+    style::Modifier,
     Frame,
 };
 use tachyonfx::Duration;
@@ -35,6 +36,7 @@ pub fn render_main_ui(
 
     render_projects_table(f, app, widget_states, layout[0]);
     render_popups(f, widget_states, layout[0], last_tick);
+    render_hover_highlight(f, widget_states);
     render_effects(f, effects, last_tick, frame_area);
 
     // Handle screen capture if requested
@@ -236,12 +238,22 @@ fn update_main_click_regions(
     };
 
     let content_area = table_area.inner(Margin::new(2, 1));
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(16),
+            Constraint::Min(40),
+            Constraint::Percentage(100),
+        ])
+        .spacing(1)
+        .split(content_area);
     let offset = widget_states.project_table_state.offset();
     let mut row_y = content_area.y;
 
-    let pipeline_col_x = (content_area.x + 36).min(content_area.right());
-    let pipeline_col_w = content_area.right().saturating_sub(pipeline_col_x);
-    let project_col_w = pipeline_col_x.saturating_sub(content_area.x);
+    let project_col_x = cols[1].x;
+    let project_col_w = cols[1].width;
+    let pipeline_col_x = cols[2].x;
+    let pipeline_col_w = cols[2].width;
 
     for (table_row, proj) in filtered_projects.iter().enumerate().skip(offset) {
         if row_y >= content_area.bottom() {
@@ -264,6 +276,7 @@ fn update_main_click_regions(
             if pipeline_col_w > 0 {
                 widget_states.click_regions.push(ClickRegion {
                     area: Rect::new(pipeline_col_x, line_y, pipeline_col_w, 1),
+                    hover_area: None,
                     action: ClickAction::SelectProjectAndDispatch {
                         table_row,
                         project_id: proj.id,
@@ -274,9 +287,15 @@ fn update_main_click_regions(
         }
 
         let visible_h = row_height.min(content_area.bottom().saturating_sub(row_y));
-        if project_col_w > 0 && visible_h > 0 {
+        if visible_h > 0 {
             widget_states.click_regions.push(ClickRegion {
-                area: Rect::new(content_area.x, row_y, project_col_w, visible_h),
+                area: Rect::new(
+                    content_area.x,
+                    row_y,
+                    cols[0].width + 1 + project_col_w,
+                    visible_h,
+                ),
+                hover_area: Some(Rect::new(project_col_x, row_y, project_col_w, visible_h)),
                 action: ClickAction::SelectProjectAndDispatch {
                     table_row,
                     project_id: proj.id,
@@ -301,6 +320,7 @@ fn update_main_click_regions(
             let line_y = feed_inner.y + vis_idx as u16;
             widget_states.click_regions.push(ClickRegion {
                 area: Rect::new(feed_inner.x, line_y, feed_inner.width, 1),
+                hover_area: None,
                 action: ClickAction::SelectActivityAndDispatch {
                     index: abs_idx,
                     activity_id: ev.id,
@@ -336,6 +356,7 @@ fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
             if row_y < actions_area.bottom() {
                 widget_states.click_regions.push(ClickRegion {
                     area: Rect::new(actions_area.x, row_y, actions_area.width, 1),
+                    hover_area: None,
                     action: ClickAction::Dispatch(vec![
                         GlimEvent::ActivityDetailsClose,
                         action.clone(),
@@ -366,6 +387,7 @@ fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
             if row_y < actions_area.bottom() {
                 widget_states.click_regions.push(ClickRegion {
                     area: Rect::new(actions_area.x, row_y, actions_area.width, 1),
+                    hover_area: None,
                     action: ClickAction::Dispatch(vec![
                         GlimEvent::PipelineActionsClose,
                         action.clone(),
@@ -384,6 +406,12 @@ fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
         if header_h > 0 {
             widget_states.click_regions.push(ClickRegion {
                 area: Rect::new(content_area.x, content_area.y, content_area.width, header_h),
+                hover_area: Some(Rect::new(
+                    content_area.x,
+                    content_area.y,
+                    content_area.width.saturating_sub(22),
+                    header_h,
+                )),
                 action: ClickAction::Dispatch(vec![GlimEvent::ProjectOpenUrl(pd.project.id)]),
             });
         }
@@ -407,12 +435,49 @@ fn update_popup_click_regions(widget_states: &mut StatefulWidgets) {
             };
             widget_states.click_regions.push(ClickRegion {
                 area: Rect::new(content_area.x, row_y, content_area.width, row_h),
+                hover_area: None,
                 action: ClickAction::SelectPipelineAndDispatch {
                     table_row,
                     pipeline_id: p.id,
                     event,
                 },
             });
+        }
+    }
+}
+
+fn render_hover_highlight(f: &mut Frame, widget_states: &StatefulWidgets) {
+    let Some(pos) = widget_states.mouse_position else {
+        return;
+    };
+    let Some(region) = widget_states
+        .click_regions
+        .iter()
+        .find(|r| r.area.contains(pos))
+    else {
+        return;
+    };
+
+    let buf = f.buffer_mut();
+    let target_rect = region.hover_area.unwrap_or(region.area);
+    let area = target_rect.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        let mut first_non_space = None;
+        let mut last_non_space = None;
+        for x in area.left()..area.right() {
+            let sym = buf[(x, y)].symbol();
+            if !sym.trim().is_empty() {
+                if first_non_space.is_none() {
+                    first_non_space = Some(x);
+                }
+                last_non_space = Some(x);
+            }
+        }
+        if let (Some(start_x), Some(end_x)) = (first_non_space, last_non_space) {
+            for x in start_x..=end_x {
+                let cell = &mut buf[(x, y)];
+                cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+            }
         }
     }
 }

@@ -265,6 +265,7 @@ impl EventHandler {
                 if matches!(
                     e.kind,
                     MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Moved
                         | MouseEventKind::ScrollUp
                         | MouseEventKind::ScrollDown
                 ) =>
