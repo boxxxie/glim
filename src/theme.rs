@@ -93,9 +93,7 @@ impl Theme {
             border_title: Style::default()
                 .fg(Gruvbox::Light2.into())
                 .add_modifier(Modifier::BOLD),
-            highlight_symbol: Style::default()
-                .bg(Gruvbox::Dark1.into())
-                .add_modifier(Modifier::BOLD),
+            highlight_symbol: Style::default().bg(Gruvbox::Dark1.into()),
             notification: Style::default()
                 .bg(Gruvbox::Dark0.into())
                 .fg(Gruvbox::Orange.into())
