@@ -119,6 +119,8 @@ pub struct EffectRegistry {
     popup_effects_enabled: bool,
     /// Whether notification banner scramble/blink effects are enabled
     notification_effects_enabled: bool,
+    /// Duration (ms) for in-app notification banner display
+    in_app_notification_timeout_ms: u64,
     /// Remaining duration (ms) of active finite effects
     active_remaining_ms: u32,
     /// Count of open popups with active background-dimming shader
@@ -147,6 +149,7 @@ impl EffectRegistry {
             table_sweep_enabled: true,
             popup_effects_enabled: true,
             notification_effects_enabled: true,
+            in_app_notification_timeout_ms: 5000,
             active_remaining_ms: 0,
             open_popups: 0,
             notification_seq: Arc::new(AtomicU64::new(0)),
@@ -181,6 +184,7 @@ impl EffectRegistry {
                 self.table_sweep_enabled = config.table_sweep_effect;
                 self.popup_effects_enabled = config.popup_effects;
                 self.notification_effects_enabled = config.notification_effects;
+                self.in_app_notification_timeout_ms = config.in_app_notification_timeout_ms;
                 self.register_default_glitch_effect();
             },
             _ => (),
@@ -388,12 +392,13 @@ impl EffectRegistry {
     /// 4. Fade out text and redraw border (350ms total)
     /// 5. Dispatch close notification event
     pub fn register_notification_effect(&mut self, content_area: RefRect) {
+        let hold_ms = self.in_app_notification_timeout_ms.max(500);
         if !self.animations_enabled || !self.notification_effects_enabled {
             let seq = self.notification_seq.fetch_add(1, Ordering::Relaxed) + 1;
             let seq_ref = self.notification_seq.clone();
             let sender = self.sender.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
                 if seq_ref.load(Ordering::Relaxed) == seq {
                     sender.dispatch(GlimEvent::NotificationDismiss);
                 }
@@ -404,6 +409,7 @@ impl EffectRegistry {
 
         use crate::gruvbox::Gruvbox::Dark0Hard;
 
+        let hold_u32 = hold_ms as u32;
         let main_fx = sequence(&[
             // 1. clear the border (border is already cleared, so we first fill it back in)
             parallel(&[
@@ -414,7 +420,7 @@ impl EffectRegistry {
             fade_from_fg(Dark0Hard, (250, SineOut)),
             // 3. smooth blink while notification is shown
             with_duration(
-                Duration::from_millis(6000),
+                Duration::from_millis(hold_u32),
                 repeating(ping_pong(hsl_shift_fg([0.0, 0.0, 25.0], (500, SineOut)))),
             ),
             // 4. fade out notification text and then redraw border
@@ -433,7 +439,7 @@ impl EffectRegistry {
             self.dispatch(GlimEvent::NotificationDismiss),
         ]);
 
-        self.active_remaining_ms = self.active_remaining_ms.max(7000);
+        self.active_remaining_ms = self.active_remaining_ms.max(hold_u32 + 1000);
         self.add_unique(FxId::Notification, fx);
     }
 

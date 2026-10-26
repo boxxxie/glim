@@ -31,13 +31,8 @@ pub struct ProjectStore {
     projects: Vec<Project>,
     project_id_lookup: HashMap<ProjectId, usize>,
     sorted: Vec<Project>,
-    max_recent_pipelines: usize,
-    include_mr_pipelines: bool,
+    config: GlimConfig,
     auto_fetch_days: i64,
-    os_notifications: bool,
-    ignore_bot_comments: bool,
-    include_projects: Option<Vec<CompactString>>,
-    exclude_projects: Option<Vec<CompactString>>,
     hydrated_pipelines: HashSet<ProjectId>,
     hydrated_mrs: HashSet<ProjectId>,
     fetched_this_session: HashSet<ProjectId>,
@@ -76,13 +71,8 @@ impl ProjectStore {
             projects: Vec::new(),
             project_id_lookup: HashMap::new(),
             sorted: Vec::new(),
-            max_recent_pipelines: config.max_recent_pipelines,
-            include_mr_pipelines: config.include_mr_pipelines,
+            config: config.clone(),
             auto_fetch_days,
-            os_notifications: config.os_notifications,
-            ignore_bot_comments: config.ignore_bot_comments,
-            include_projects: config.include_projects.clone(),
-            exclude_projects: config.exclude_projects.clone(),
             hydrated_pipelines: HashSet::new(),
             hydrated_mrs: HashSet::new(),
             fetched_this_session: HashSet::new(),
@@ -115,25 +105,93 @@ impl ProjectStore {
 
     pub fn notify_latest_activity(&self) {
         if let Some(latest) = self.recent_activity.first() {
-            let (summary, body, urgency) = format_activity_notification(latest);
-            if self.os_notifications {
-                send_os_notification(&summary, &body, urgency);
+            let (summary, body, urgency) = format_activity_notification(latest, &self.config);
+            let url = self.resolve_activity_url(latest);
+            if self.config.os_notifications {
+                send_os_notification(
+                    &summary,
+                    &body,
+                    urgency,
+                    self.config.os_notification_timeout_ms,
+                    url.as_deref(),
+                );
             }
         }
     }
 
-    fn emit_notification(&self, summary: &str, body: &str, urgency: NotifyUrgency) {
-        let banner_msg: CompactString = format!("{summary}: {body}").into();
-        self.sender.dispatch(GlimEvent::ActivityNotice(banner_msg));
-        if self.os_notifications {
-            send_os_notification(summary, body, urgency);
+    fn resolve_activity_url(&self, ev: &ProjectActivityEvent) -> Option<String> {
+        let project = self.find(ev.project_id)?;
+        if let Some(iid) = ev.mr_iid {
+            if let Some(mr) = project.merge_request(iid) {
+                return Some(mr.url.to_string());
+            }
+            return Some(format!("{}/-/merge_requests/{iid}", project.url));
+        }
+        if let Some(ref body) = ev.body {
+            for line in body.lines() {
+                if let Some(url) = line.strip_prefix("URL: ") {
+                    let trimmed = url.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(ref sha) = ev.commit_sha {
+            if !sha.is_empty() {
+                return Some(format!("{}/-/commit/{sha}", project.url));
+            }
+        }
+        if let Some(ref branch) = ev.branch {
+            if let Some(mr) = project.merge_request_for_branch(branch) {
+                return Some(mr.url.to_string());
+            }
+        }
+        Some(project.url.to_string())
+    }
+
+    fn emit_notification(
+        &self,
+        summary: &str,
+        body: &str,
+        urgency: NotifyUrgency,
+        url: Option<&str>,
+    ) {
+        if self.config.in_app_notifications {
+            let banner_msg: CompactString = format!("{summary}: {body}").into();
+            self.sender.dispatch(GlimEvent::ActivityNotice(banner_msg));
+        }
+        if self.config.os_notifications {
+            send_os_notification(
+                summary,
+                body,
+                urgency,
+                self.config.os_notification_timeout_ms,
+                url,
+            );
+        }
+    }
+
+    fn should_notify_activity(&self, kind: &ActivityKind) -> bool {
+        match kind {
+            ActivityKind::Mention
+            | ActivityKind::ReviewRequested
+            | ActivityKind::Assigned
+            | ActivityKind::MergeTrainRemoved => self.config.notify_mentions_and_todos,
+            ActivityKind::MrOpened | ActivityKind::MrMerged | ActivityKind::MrClosed => {
+                self.config.notify_mr_events
+            },
+            ActivityKind::MrApproved => self.config.notify_mr_approved,
+            ActivityKind::MrComment => self.config.notify_mr_comments,
+            ActivityKind::BranchPush => self.config.notify_branch_push,
+            ActivityKind::PipelineStatus => true,
         }
     }
 
     fn should_paginate_project(&self, project: &Project) -> bool {
         let path_lower = project.path.to_lowercase();
 
-        if let Some(excludes) = &self.exclude_projects {
+        if let Some(excludes) = &self.config.exclude_projects {
             if excludes
                 .iter()
                 .map(|s| s.trim().to_lowercase())
@@ -144,7 +202,7 @@ impl ProjectStore {
             }
         }
 
-        if let Some(includes) = &self.include_projects {
+        if let Some(includes) = &self.config.include_projects {
             let terms: Vec<String> = includes
                 .iter()
                 .map(|s| s.trim().to_lowercase())
@@ -169,22 +227,19 @@ impl ProjectStore {
     pub fn apply(&mut self, event: &GlimEvent) {
         match event {
             GlimEvent::ConfigUpdate(config) => {
-                self.max_recent_pipelines = config.max_recent_pipelines;
-                self.include_mr_pipelines = config.include_mr_pipelines;
                 self.auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
-                self.os_notifications = config.os_notifications;
-                self.ignore_bot_comments = config.ignore_bot_comments;
-                self.include_projects = config.include_projects.clone();
-                self.exclude_projects = config.exclude_projects.clone();
+                self.config = config.clone();
             },
 
             // requests jobs for pipelines that have not been loaded yet, plus fresh MRs & events
             GlimEvent::ProjectDetailsOpen(id) => {
                 debug!(project_id = %id, "Opening project details and requesting missing jobs");
+                let max_recent = self.config.max_recent_pipelines;
+                let include_mr = self.config.include_mr_pipelines;
                 let project = self.find(*id).unwrap();
                 let project_id = project.id;
                 project
-                    .recent_pipelines(self.max_recent_pipelines, self.include_mr_pipelines)
+                    .recent_pipelines(max_recent, include_mr)
                     .into_iter()
                     .filter(|p| p.jobs.is_none())
                     .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project_id, p.id)));
@@ -230,8 +285,15 @@ impl ProjectStore {
                 let sender = self.sender.clone();
 
                 let is_hydrated = self.hydrated_pipelines.contains(&project_id);
-                let mut notifications: Vec<(String, String, NotifyUrgency)> = Vec::new();
+                let mut notifications: Vec<(String, String, NotifyUrgency, Option<String>)> =
+                    Vec::new();
                 let mut pipeline_feed_events: Vec<ProjectActivityEvent> = Vec::new();
+                let notify_failed = self.config.notify_pipeline_failed;
+                let notify_passed = self.config.notify_pipeline_passed;
+                let notify_running = self.config.notify_pipeline_running;
+                let urg_failed = self.config.notify_urgency_pipeline_failed;
+                let urg_passed = self.config.notify_urgency_pipeline_passed;
+                let urg_running = self.config.notify_urgency_pipeline_running;
 
                 if let Some(project) = self.find_mut(project_id) {
                     let project_title = project.title();
@@ -249,9 +311,11 @@ impl ProjectStore {
                                 .unwrap_or(0);
 
                             for p in &new_pipelines {
-                                let mr_iid = project
-                                    .merge_request_for_branch(&p.branch)
-                                    .map(|mr| mr.iid);
+                                let mr = project.merge_request_for_branch(&p.branch);
+                                let mr_iid = mr.map(|m| m.iid);
+                                let target_url = mr
+                                    .map(|m| m.url.to_string())
+                                    .unwrap_or_else(|| p.url.to_string());
                                 let mr_tag = mr_iid
                                     .map(|iid| format!(" (!{})", iid))
                                     .unwrap_or_default();
@@ -262,14 +326,16 @@ impl ProjectStore {
                                             PipelineStatus::Failed => Some((
                                                 format!("🔴 [{}] Pipeline failed", project_title),
                                                 format!("{}{}", p.branch, mr_tag),
-                                                NotifyUrgency::Critical,
+                                                urg_failed,
                                                 "failed",
+                                                notify_failed,
                                             )),
                                             PipelineStatus::Success => Some((
                                                 format!("🟢 [{}] Pipeline passed", project_title),
                                                 format!("{}{}", p.branch, mr_tag),
-                                                NotifyUrgency::Normal,
+                                                urg_passed,
                                                 "passed",
+                                                notify_passed,
                                             )),
                                             _ if !old_p.status.is_active()
                                                 && p.status.is_active() =>
@@ -280,14 +346,24 @@ impl ProjectStore {
                                                         project_title
                                                     ),
                                                     format!("{}{}", p.branch, mr_tag),
-                                                    NotifyUrgency::Normal,
+                                                    urg_running,
                                                     "running",
+                                                    notify_running,
                                                 ))
                                             },
                                             _ => None,
                                         };
-                                        if let Some((sum, body, urg, label)) = transition {
-                                            notifications.push((sum.clone(), body.clone(), urg));
+                                        if let Some((sum, body, urg, label, should_notify)) =
+                                            transition
+                                        {
+                                            if should_notify {
+                                                notifications.push((
+                                                    sum.clone(),
+                                                    body.clone(),
+                                                    urg,
+                                                    Some(target_url.clone()),
+                                                ));
+                                            }
                                             pipeline_feed_events.push(ProjectActivityEvent {
                                                 id: p.id.value().wrapping_mul(1000)
                                                     + (p.updated_at.timestamp() as u64 % 1000),
@@ -311,25 +387,36 @@ impl ProjectStore {
                                         PipelineStatus::Failed => Some((
                                             format!("🔴 [{}] Pipeline failed", project_title),
                                             format!("{}{}", p.branch, mr_tag),
-                                            NotifyUrgency::Critical,
+                                            urg_failed,
                                             "failed",
+                                            notify_failed,
                                         )),
                                         PipelineStatus::Success => Some((
                                             format!("🟢 [{}] Pipeline passed", project_title),
                                             format!("{}{}", p.branch, mr_tag),
-                                            NotifyUrgency::Normal,
+                                            urg_passed,
                                             "passed",
+                                            notify_passed,
                                         )),
                                         _ if p.status.is_active() => Some((
                                             format!("🔵 [{}] Pipeline started", project_title),
                                             format!("{}{}", p.branch, mr_tag),
-                                            NotifyUrgency::Normal,
+                                            urg_running,
                                             "started",
+                                            notify_running,
                                         )),
                                         _ => None,
                                     };
-                                    if let Some((sum, body, urg, label)) = transition {
-                                        notifications.push((sum.clone(), body.clone(), urg));
+                                    if let Some((sum, body, urg, label, should_notify)) = transition
+                                    {
+                                        if should_notify {
+                                            notifications.push((
+                                                sum.clone(),
+                                                body.clone(),
+                                                urg,
+                                                Some(target_url.clone()),
+                                            ));
+                                        }
                                         pipeline_feed_events.push(ProjectActivityEvent {
                                             id: p.id.value().wrapping_mul(1000)
                                                 + (p.updated_at.timestamp() as u64 % 1000),
@@ -371,8 +458,8 @@ impl ProjectStore {
                 }
 
                 self.hydrated_pipelines.insert(project_id);
-                for (summary, body, urgency) in notifications {
-                    self.emit_notification(&summary, &body, urgency);
+                for (summary, body, urgency, url) in notifications {
+                    self.emit_notification(&summary, &body, urgency, url.as_deref());
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
@@ -388,7 +475,13 @@ impl ProjectStore {
                 );
                 let sender = self.sender.clone();
                 let is_hydrated = self.hydrated_mrs.contains(project_id);
-                let mut notifications: Vec<(String, String, NotifyUrgency)> = Vec::new();
+                let mut notifications: Vec<(String, String, NotifyUrgency, Option<String>)> =
+                    Vec::new();
+                let notify_conflicts = self.config.notify_mr_conflicts;
+                let notify_approved = self.config.notify_mr_approved;
+                let notify_threads = self.config.notify_mr_threads;
+                let urg_conflicts = self.config.notify_urgency_mr_conflicts;
+                let urg_default = self.config.notify_urgency_default;
 
                 if let Some(project) = self.find_mut(*project_id) {
                     let project_title = project.title();
@@ -403,35 +496,43 @@ impl ProjectStore {
                             if let Some(old_mr) =
                                 project.merge_requests.iter().find(|omr| omr.iid == mr.iid)
                             {
-                                if !old_mr.is_conflicted() && mr.is_conflicted() {
+                                let mr_url = Some(mr.url.to_string());
+                                if notify_conflicts && !old_mr.is_conflicted() && mr.is_conflicted()
+                                {
                                     notifications.push((
                                         format!("⚡ [{}] !{} has merge conflicts", project_title, mr.iid),
                                         format!("{} ({})", mr.title, mr.source_branch),
-                                        NotifyUrgency::Critical,
+                                        urg_conflicts,
+                                        mr_url.clone(),
                                     ));
                                 }
-                                if mr.upvotes > old_mr.upvotes {
+                                if notify_approved && mr.upvotes > old_mr.upvotes {
                                     notifications.push((
                                         format!("👍 [{}] !{} approved", project_title, mr.iid),
                                         format!("{} (👍{})", mr.title, mr.upvotes),
-                                        NotifyUrgency::Normal,
+                                        urg_default,
+                                        mr_url.clone(),
                                     ));
                                 }
-                                if old_mr.blocking_discussions_resolved
+                                if notify_threads
+                                    && old_mr.blocking_discussions_resolved
                                     && !mr.blocking_discussions_resolved
                                 {
                                     notifications.push((
                                         format!("🔒 [{}] !{} has unresolved threads", project_title, mr.iid),
                                         mr.title.to_string(),
-                                        NotifyUrgency::Normal,
+                                        urg_default,
+                                        mr_url.clone(),
                                     ));
-                                } else if !old_mr.blocking_discussions_resolved
+                                } else if notify_threads
+                                    && !old_mr.blocking_discussions_resolved
                                     && mr.blocking_discussions_resolved
                                 {
                                     notifications.push((
                                         format!("✅ [{}] !{} threads resolved", project_title, mr.iid),
                                         mr.title.to_string(),
-                                        NotifyUrgency::Normal,
+                                        urg_default,
+                                        mr_url,
                                     ));
                                 }
                             }
@@ -443,8 +544,8 @@ impl ProjectStore {
                 }
 
                 self.hydrated_mrs.insert(*project_id);
-                for (summary, body, urgency) in notifications {
-                    self.emit_notification(&summary, &body, urgency);
+                for (summary, body, urgency, url) in notifications {
+                    self.emit_notification(&summary, &body, urgency, url.as_deref());
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
@@ -480,7 +581,7 @@ impl ProjectStore {
                 let current_username = self.current_username.clone();
 
                 for dto in event_dtos {
-                    if self.ignore_bot_comments && dto.is_bot_event() {
+                    if self.config.ignore_bot_comments && dto.is_bot_event() {
                         continue;
                     }
                     if let Some(mut activity) =
@@ -524,17 +625,27 @@ impl ProjectStore {
                 // Emit notifications for newly arrived events in chronological order
                 newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
                 for ev in newly_arrived {
-                    let (summary, body, urgency) = format_activity_notification(&ev);
-                    self.emit_notification(&summary, &body, urgency);
+                    if self.should_notify_activity(&ev.kind) {
+                        let (summary, body, urgency) =
+                            format_activity_notification(&ev, &self.config);
+                        let url = self.resolve_activity_url(&ev);
+                        self.emit_notification(&summary, &body, urgency, url.as_deref());
+                    }
                 }
 
                 // On first startup hydration, emit the single latest activity notification so the user
                 // sees immediate confirmation that in-app and OS notifications are active.
                 if !self.startup_notified {
-                    if let Some(latest) = self.recent_activity.first() {
-                        self.startup_notified = true;
-                        let (summary, body, urgency) = format_activity_notification(latest);
-                        self.emit_notification(&summary, &body, urgency);
+                    self.startup_notified = true;
+                    if self.config.notify_on_startup {
+                        if let Some(latest) = self.recent_activity.first() {
+                            if self.should_notify_activity(&latest.kind) {
+                                let (summary, body, urgency) =
+                                    format_activity_notification(latest, &self.config);
+                                let url = self.resolve_activity_url(latest);
+                                self.emit_notification(&summary, &body, urgency, url.as_deref());
+                            }
+                        }
                     }
                 }
             },
@@ -573,7 +684,7 @@ impl ProjectStore {
                 let mut added_any = false;
                 let current_username = self.current_username.clone();
                 for dto in event_dtos {
-                    if self.ignore_bot_comments && dto.is_bot_event() {
+                    if self.config.ignore_bot_comments && dto.is_bot_event() {
                         continue;
                     }
                     if let Some(mut activity) =
@@ -630,7 +741,7 @@ impl ProjectStore {
                     .unwrap_or(prev_max_todo_id.unwrap_or(0));
                 self.last_seen_todo_id = Some(max_todo_id);
 
-                let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
+                let mut newly_arrived: Vec<(ProjectActivityEvent, Option<String>)> = Vec::new();
                 let mut added_any = false;
                 let current_username = self.current_username.clone();
                 for todo in todos {
@@ -641,7 +752,12 @@ impl ProjectStore {
                             .any(|existing| is_duplicate_activity(existing, &activity));
                         if let Some(prev_max) = prev_max_todo_id {
                             if todo.id > prev_max && !already_present {
-                                newly_arrived.push(activity.clone());
+                                let todo_url = if !todo.target_url.is_empty() {
+                                    Some(todo.target_url.to_string())
+                                } else {
+                                    self.resolve_activity_url(&activity)
+                                };
+                                newly_arrived.push((activity.clone(), todo_url));
                             }
                         }
                         if !already_present {
@@ -657,10 +773,14 @@ impl ProjectStore {
                     self.save_activity_cache();
                 }
 
-                newly_arrived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-                for ev in newly_arrived {
-                    let (summary, body, urgency) = format_activity_notification(&ev);
-                    self.emit_notification(&summary, &body, urgency);
+                newly_arrived.sort_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at));
+                for (ev, todo_url) in newly_arrived {
+                    if self.should_notify_activity(&ev.kind) {
+                        let (summary, body, urgency) =
+                            format_activity_notification(&ev, &self.config);
+                        let url = todo_url.or_else(|| self.resolve_activity_url(&ev));
+                        self.emit_notification(&summary, &body, urgency, url.as_deref());
+                    }
                 }
             },
 
@@ -1214,6 +1334,7 @@ fn is_duplicate_activity(
 
 fn format_activity_notification(
     ev: &ProjectActivityEvent,
+    config: &GlimConfig,
 ) -> (String, String, NotifyUrgency) {
     let mr_ref = ev
         .mr_iid
@@ -1230,10 +1351,18 @@ fn format_activity_notification(
         mr_ref
     );
     let body = ev.summary.to_string();
-    let urgency = if ev.kind.is_direct_attention() {
-        NotifyUrgency::Critical
+    let urgency = if ev.kind == ActivityKind::PipelineStatus {
+        if ev.summary.ends_with("failed") {
+            config.notify_urgency_pipeline_failed
+        } else if ev.summary.ends_with("passed") {
+            config.notify_urgency_pipeline_passed
+        } else {
+            config.notify_urgency_pipeline_running
+        }
+    } else if ev.kind.is_direct_attention() {
+        config.notify_urgency_mentions
     } else {
-        NotifyUrgency::Normal
+        config.notify_urgency_default
     };
     (summary, body, urgency)
 }
@@ -1414,8 +1543,13 @@ mod tests {
         };
         let mention_activity = convert_gitlab_event(&mention_comment, &project, "paul").unwrap();
         assert_eq!(mention_activity.kind, ActivityKind::Mention);
-        let (_, _, urgency) = format_activity_notification(&mention_activity);
-        assert!(matches!(urgency, NotifyUrgency::Critical));
+        let default_cfg = GlimConfig::default();
+        let (_, _, urgency) = format_activity_notification(&mention_activity, &default_cfg);
+        assert!(matches!(urgency, NotifyUrgency::Normal));
+        let mut critical_cfg = GlimConfig::default();
+        critical_cfg.notify_urgency_mentions = NotifyUrgency::Critical;
+        let (_, _, crit_urgency) = format_activity_notification(&mention_activity, &critical_cfg);
+        assert!(matches!(crit_urgency, NotifyUrgency::Critical));
         assert!(contains_mention("cc @paul!", "paul"));
         assert!(!contains_mention("cc @paulina", "paul"));
     }

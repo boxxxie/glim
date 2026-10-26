@@ -17,6 +17,7 @@ use crate::{
     input::{processor::NormalModeProcessor, InputMultiplexer},
     logging::LoggingReloadHandle,
     notice_service::{Notice, NoticeLevel, NoticeService},
+    os_notify::NotifyUrgency,
     result::GlimError,
     stores::{log_event, ProjectStore},
     ui::{widget::NotificationState, StatefulWidgets},
@@ -59,6 +60,18 @@ pub const fn default_jobs_poll_seconds() -> u64 {
 
 pub const fn default_activity_feed_lines() -> u16 {
     6
+}
+
+pub const fn default_os_notification_timeout_ms() -> u64 {
+    8000
+}
+
+pub const fn default_in_app_notification_timeout_ms() -> u64 {
+    5000
+}
+
+pub const fn default_urgency_normal() -> NotifyUrgency {
+    NotifyUrgency::Normal
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -107,6 +120,66 @@ pub struct GlimConfig {
     /// Send desktop OS notifications via notify-send on pipeline/MR updates (default: true)
     #[serde(default = "default_true")]
     pub os_notifications: bool,
+    /// Show in-app notification banners (default: true)
+    #[serde(default = "default_true")]
+    pub in_app_notifications: bool,
+    /// Emit a single latest activity notification on startup hydration (default: true)
+    #[serde(default = "default_true")]
+    pub notify_on_startup: bool,
+    /// Desktop OS notification timeout in milliseconds (default: 8000)
+    #[serde(default = "default_os_notification_timeout_ms")]
+    pub os_notification_timeout_ms: u64,
+    /// In-app notification banner display duration in milliseconds (default: 5000)
+    #[serde(default = "default_in_app_notification_timeout_ms")]
+    pub in_app_notification_timeout_ms: u64,
+    /// Notify when a pipeline fails (default: true)
+    #[serde(default = "default_true")]
+    pub notify_pipeline_failed: bool,
+    /// Notify when a pipeline passes (default: true)
+    #[serde(default = "default_true")]
+    pub notify_pipeline_passed: bool,
+    /// Notify when a pipeline starts or transitions to running (default: true)
+    #[serde(default = "default_true")]
+    pub notify_pipeline_running: bool,
+    /// Notify when an MR develops merge conflicts (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mr_conflicts: bool,
+    /// Notify when an MR receives new approvals (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mr_approved: bool,
+    /// Notify when MR discussion threads become unresolved or resolved (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mr_threads: bool,
+    /// Notify on MR lifecycle events: opened, merged, closed (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mr_events: bool,
+    /// Notify on MR comments (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mr_comments: bool,
+    /// Notify on branch pushes (default: true)
+    #[serde(default = "default_true")]
+    pub notify_branch_push: bool,
+    /// Notify on direct mentions, review requests, assignments, and merge train removals (default: true)
+    #[serde(default = "default_true")]
+    pub notify_mentions_and_todos: bool,
+    /// OS notification urgency for failed pipelines: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_pipeline_failed: NotifyUrgency,
+    /// OS notification urgency for passed pipelines: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_pipeline_passed: NotifyUrgency,
+    /// OS notification urgency for running pipelines: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_pipeline_running: NotifyUrgency,
+    /// OS notification urgency for MR merge conflicts: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_mr_conflicts: NotifyUrgency,
+    /// OS notification urgency for mentions, review requests, and todos: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_mentions: NotifyUrgency,
+    /// Default OS notification urgency for other activity events: "low", "normal", or "critical" (default: "normal")
+    #[serde(default = "default_urgency_normal")]
+    pub notify_urgency_default: NotifyUrgency,
     /// Ignore automated bot / linear-linkback comments in notifications & feed (default: true)
     #[serde(default = "default_true")]
     pub ignore_bot_comments: bool,
@@ -140,6 +213,26 @@ impl Default for GlimConfig {
             include_projects: None,
             exclude_projects: None,
             os_notifications: true,
+            in_app_notifications: true,
+            notify_on_startup: true,
+            os_notification_timeout_ms: default_os_notification_timeout_ms(),
+            in_app_notification_timeout_ms: default_in_app_notification_timeout_ms(),
+            notify_pipeline_failed: true,
+            notify_pipeline_passed: true,
+            notify_pipeline_running: true,
+            notify_mr_conflicts: true,
+            notify_mr_approved: true,
+            notify_mr_threads: true,
+            notify_mr_events: true,
+            notify_mr_comments: true,
+            notify_branch_push: true,
+            notify_mentions_and_todos: true,
+            notify_urgency_pipeline_failed: default_urgency_normal(),
+            notify_urgency_pipeline_passed: default_urgency_normal(),
+            notify_urgency_pipeline_running: default_urgency_normal(),
+            notify_urgency_mr_conflicts: default_urgency_normal(),
+            notify_urgency_mentions: default_urgency_normal(),
+            notify_urgency_default: default_urgency_normal(),
             ignore_bot_comments: true,
             projects_poll_seconds: default_projects_poll_seconds(),
             jobs_poll_seconds: default_jobs_poll_seconds(),

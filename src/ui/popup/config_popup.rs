@@ -224,21 +224,9 @@ impl ConfigPopupState {
             search_filter,
             log_level,
             animations,
-            glitch_effect: self.base_config.glitch_effect,
-            table_sweep_effect: self.base_config.table_sweep_effect,
-            popup_effects: self.base_config.popup_effects,
-            notification_effects: self.base_config.notification_effects,
             max_pipelines_per_project,
-            max_recent_pipelines: self.base_config.max_recent_pipelines,
             max_age_days,
-            include_mr_pipelines: self.base_config.include_mr_pipelines,
-            include_projects: self.base_config.include_projects.clone(),
-            exclude_projects: self.base_config.exclude_projects.clone(),
-            os_notifications: self.base_config.os_notifications,
-            ignore_bot_comments: self.base_config.ignore_bot_comments,
-            projects_poll_seconds: self.base_config.projects_poll_seconds,
-            jobs_poll_seconds: self.base_config.jobs_poll_seconds,
-            activity_feed_lines: self.base_config.activity_feed_lines,
+            ..self.base_config.clone()
         }
     }
 
