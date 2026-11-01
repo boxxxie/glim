@@ -1,18 +1,100 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Sender},
+    thread,
 };
+
+const MAX_IN_MEMORY_ACTIVITY_EVENTS: usize = 10_000;
+const MAX_IN_MEMORY_COMMITS: usize = 5_000;
+const DEFAULT_HYDRATE_MAX_PROJECTS: usize = 200;
+
+const DUCKDB_LOW_MEMORY_SQL: &str = "\
+SET threads=1;
+SET external_threads=1;
+SET async_threads=1;
+SET preserve_insertion_order=false;
+SET memory_limit='8MB';
+SET allocator_flush_threshold='512KB';
+SET allocator_bulk_deallocation_flush_threshold='512KB';
+SET wal_autocheckpoint='256KB';
+";
+
+const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS projects (
+    id BIGINT PRIMARY KEY,
+    path VARCHAR,
+    default_branch VARCHAR,
+    url VARCHAR,
+    last_activity_at VARCHAR,
+    pipeline_count BIGINT,
+    open_mr_count BIGINT,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS pipelines (
+    id BIGINT PRIMARY KEY,
+    project_id BIGINT,
+    project_path VARCHAR,
+    status VARCHAR,
+    source VARCHAR,
+    branch VARCHAR,
+    url VARCHAR,
+    created_at VARCHAR,
+    updated_at VARCHAR,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS merge_requests (
+    id BIGINT PRIMARY KEY,
+    iid BIGINT,
+    project_id BIGINT,
+    project_path VARCHAR,
+    title VARCHAR,
+    state VARCHAR,
+    source_branch VARCHAR,
+    target_branch VARCHAR,
+    draft BOOLEAN,
+    has_conflicts BOOLEAN,
+    blocking_discussions_resolved BOOLEAN,
+    upvotes BIGINT,
+    author_username VARCHAR,
+    updated_at VARCHAR,
+    url VARCHAR,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS activity_events (
+    id BIGINT PRIMARY KEY,
+    project_id BIGINT,
+    project_name VARCHAR,
+    kind VARCHAR,
+    author VARCHAR,
+    mr_iid BIGINT,
+    branch VARCHAR,
+    commit_sha VARCHAR,
+    summary VARCHAR,
+    created_at VARCHAR,
+    payload VARCHAR
+);
+CREATE TABLE IF NOT EXISTS commits (
+    id VARCHAR PRIMARY KEY,
+    title VARCHAR,
+    author_name VARCHAR,
+    message VARCHAR,
+    payload VARCHAR
+);
+"#;
 
 use chrono::{DateTime, Utc};
 use compact_str::CompactString;
 use itertools::Itertools;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tracing::{debug, info, instrument, warn};
 
 use crate::{
+    config::{default_data_dir, default_quack_token_path},
     dispatcher::Dispatcher,
     domain::{
         clean_multiline_body, clean_note_body, contains_mention, ActivityKind, CommitDto,
@@ -25,9 +107,101 @@ use crate::{
     os_notify::{send_os_notification, NotifyUrgency},
 };
 
+pub fn resolve_duckdb_binary() -> PathBuf {
+    if let Some(base) = directories::BaseDirs::new() {
+        let home_duckdb = base.home_dir().join(".local").join("bin").join("duckdb");
+        if home_duckdb.exists() {
+            return home_duckdb;
+        }
+    }
+    PathBuf::from("duckdb")
+}
+
+pub fn load_or_create_quack_token() -> CompactString {
+    let token_path = default_quack_token_path();
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return CompactString::from(trimmed);
+        }
+    }
+    if let Some(parent) = token_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let token = format!(
+        "glim-quack-{:x}",
+        Utc::now().timestamp_nanos_opt().unwrap_or(9497)
+    );
+    let _ = std::fs::write(&token_path, &token);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&token_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&token_path, perms);
+        }
+    }
+    CompactString::from(token)
+}
+
+fn sql_escape(s: &str) -> String {
+    s.replace('\'', "''").replace(['\r', '\n'], " ")
+}
+
+fn sql_opt_str(opt: Option<&str>) -> String {
+    match opt {
+        Some(s) => format!("'{}'", sql_escape(s)),
+        None => "NULL".to_string(),
+    }
+}
+
+fn sql_opt_u64(opt: Option<u64>) -> String {
+    match opt {
+        Some(v) => v.to_string(),
+        None => "NULL".to_string(),
+    }
+}
+
+#[derive(Debug)]
+enum SqlWorkerMsg {
+    Execute(String),
+    Shutdown(mpsc::SyncSender<()>),
+}
+
+#[derive(Debug)]
+pub struct DuckDbHandle {
+    sql_tx: Sender<SqlWorkerMsg>,
+    pub quack_listen_uri: Option<CompactString>,
+    pub quack_token: Option<CompactString>,
+}
+
+impl DuckDbHandle {
+    pub fn execute_async(&self, sql_batch: String) {
+        if !sql_batch.trim().is_empty() {
+            let _ = self.sql_tx.send(SqlWorkerMsg::Execute(sql_batch));
+        }
+    }
+
+    pub fn shutdown(&self) {
+        if let Some(ref uri) = self.quack_listen_uri {
+            let _ = self.sql_tx.send(SqlWorkerMsg::Execute(format!(
+                "CALL quack_stop('{}');",
+                sql_escape(uri)
+            )));
+        }
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if self.sql_tx.send(SqlWorkerMsg::Shutdown(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
+}
+
 pub struct ProjectStore {
     sender: Sender<GlimEvent>,
     cache_dir: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    duckdb_handle: Option<DuckDbHandle>,
     projects: Vec<Project>,
     project_id_lookup: HashMap<ProjectId, usize>,
     sorted: Vec<Project>,
@@ -53,8 +227,7 @@ impl ProjectStore {
         #[cfg(test)]
         let cache_dir = None;
         #[cfg(not(test))]
-        let cache_dir = directories::BaseDirs::new()
-            .map(|d| d.data_local_dir().join("glim").join("cache"));
+        let cache_dir = Some(default_data_dir());
 
         Self::with_cache_dir(sender, config, cache_dir)
     }
@@ -65,9 +238,12 @@ impl ProjectStore {
         cache_dir: Option<PathBuf>,
     ) -> Self {
         let auto_fetch_days = config.max_age_days.map(|d| d as i64).unwrap_or(14).max(7);
+        let db_path = cache_dir.as_ref().map(|d| d.join("glim.duckdb"));
         let mut store = Self {
             sender,
             cache_dir,
+            db_path,
+            duckdb_handle: None,
             projects: Vec::new(),
             project_id_lookup: HashMap::new(),
             sorted: Vec::new(),
@@ -87,8 +263,14 @@ impl ProjectStore {
             requested_commits: HashSet::new(),
             startup_notified: false,
         };
-        store.load_disk_cache();
+        store.init_duckdb_and_load();
         store
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some(handle) = self.duckdb_handle.take() {
+            handle.shutdown();
+        }
     }
 
     pub fn recent_activity(&self) -> &[ProjectActivityEvent] {
@@ -447,14 +629,8 @@ impl ProjectStore {
                     sender.dispatch(GlimEvent::ProjectUpdated(Box::new(project.clone())))
                 }
 
-                let has_pipeline_events = !pipeline_feed_events.is_empty();
-                for ev in pipeline_feed_events {
-                    self.recent_activity.push(ev);
-                }
-                if has_pipeline_events {
-                    self.recent_activity
-                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    self.save_activity_cache();
+                if !pipeline_feed_events.is_empty() {
+                    self.append_and_trim_activity(pipeline_feed_events);
                 }
 
                 self.hydrated_pipelines.insert(project_id);
@@ -577,7 +753,7 @@ impl ProjectStore {
                 };
 
                 let mut newly_arrived: Vec<ProjectActivityEvent> = Vec::new();
-                let mut added_any = false;
+                let mut newly_cached: Vec<ProjectActivityEvent> = Vec::new();
                 let current_username = self.current_username.clone();
 
                 for dto in event_dtos {
@@ -603,6 +779,7 @@ impl ProjectStore {
                         let already_present = self
                             .recent_activity
                             .iter()
+                            .chain(newly_cached.iter())
                             .any(|existing| is_duplicate_activity(existing, &activity));
                         if let Some(prev_max) = prev_max_id {
                             if activity.id > prev_max && !already_present {
@@ -610,16 +787,13 @@ impl ProjectStore {
                             }
                         }
                         if !already_present {
-                            self.recent_activity.push(activity);
-                            added_any = true;
+                            newly_cached.push(activity);
                         }
                     }
                 }
 
-                if added_any {
-                    self.recent_activity
-                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    self.save_activity_cache();
+                if !newly_cached.is_empty() {
+                    self.append_and_trim_activity(newly_cached);
                 }
 
                 // Emit notifications for newly arrived events in chronological order
@@ -681,7 +855,7 @@ impl ProjectStore {
                     return;
                 };
 
-                let mut added_any = false;
+                let mut newly_cached: Vec<ProjectActivityEvent> = Vec::new();
                 let current_username = self.current_username.clone();
                 for dto in event_dtos {
                     if self.config.ignore_bot_comments && dto.is_bot_event() {
@@ -706,18 +880,16 @@ impl ProjectStore {
                         let already_present = self
                             .recent_activity
                             .iter()
+                            .chain(newly_cached.iter())
                             .any(|existing| is_duplicate_activity(existing, &activity));
                         if !already_present {
-                            self.recent_activity.push(activity);
-                            added_any = true;
+                            newly_cached.push(activity);
                         }
                     }
                 }
 
-                if added_any {
-                    self.recent_activity
-                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    self.save_activity_cache();
+                if !newly_cached.is_empty() {
+                    self.append_and_trim_activity(newly_cached);
                 } else if event_dtos.len() >= 100 && *page < 50 {
                     // All events on this page were already cached locally; advance to the next page
                     let next_page = page + 1;
@@ -742,13 +914,14 @@ impl ProjectStore {
                 self.last_seen_todo_id = Some(max_todo_id);
 
                 let mut newly_arrived: Vec<(ProjectActivityEvent, Option<String>)> = Vec::new();
-                let mut added_any = false;
+                let mut newly_cached: Vec<ProjectActivityEvent> = Vec::new();
                 let current_username = self.current_username.clone();
                 for todo in todos {
                     if let Some(activity) = convert_gitlab_todo(todo, &current_username) {
                         let already_present = self
                             .recent_activity
                             .iter()
+                            .chain(newly_cached.iter())
                             .any(|existing| is_duplicate_activity(existing, &activity));
                         if let Some(prev_max) = prev_max_todo_id {
                             if todo.id > prev_max && !already_present {
@@ -761,16 +934,13 @@ impl ProjectStore {
                             }
                         }
                         if !already_present {
-                            self.recent_activity.push(activity);
-                            added_any = true;
+                            newly_cached.push(activity);
                         }
                     }
                 }
 
-                if added_any {
-                    self.recent_activity
-                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    self.save_activity_cache();
+                if !newly_cached.is_empty() {
+                    self.append_and_trim_activity(newly_cached);
                 }
 
                 newly_arrived.sort_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at));
@@ -876,25 +1046,48 @@ impl ProjectStore {
     }
 
     fn apply_commit_details(&mut self, commit: CommitDto) {
-        let mut updated_activity = false;
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
         for ev in &mut self.recent_activity {
             if ev.commit_sha.as_deref() == Some(commit.id.as_str()) {
+                let mut changed = false;
                 if !commit.title.is_empty() && ev.summary != commit.title {
                     ev.summary = commit.title.clone();
-                    updated_activity = true;
+                    changed = true;
                 }
                 let trimmed: CompactString = commit.message.trim().into();
                 if !trimmed.is_empty() && ev.body.as_ref() != Some(&trimmed) {
                     ev.body = Some(trimmed);
-                    updated_activity = true;
+                    changed = true;
+                }
+                if changed {
+                    sql.push_str(&upsert_activity_sql(ev));
                 }
             }
         }
-        self.commits.insert(commit.id.clone(), commit);
-        self.save_commits_cache();
-        if updated_activity {
-            self.save_activity_cache();
+        let is_new_commit = !self.commits.contains_key(&commit.id);
+        if is_new_commit && self.commits.len() >= MAX_IN_MEMORY_COMMITS {
+            if let Some(evict_key) = self.commits.keys().next().cloned() {
+                self.commits.remove(&evict_key);
+            }
         }
+        sql.push_str(&upsert_commit_sql(&commit));
+        sql.push_str("COMMIT;\n");
+        self.persist_sql(sql);
+        self.commits.insert(commit.id.clone(), commit);
+    }
+
+    fn append_and_trim_activity(&mut self, new_events: Vec<ProjectActivityEvent>) {
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        for ev in &new_events {
+            sql.push_str(&upsert_activity_sql(ev));
+        }
+        sql.push_str("COMMIT;\n");
+        self.persist_sql(sql);
+
+        self.recent_activity.extend(new_events);
+        self.recent_activity
+            .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        self.recent_activity.truncate(MAX_IN_MEMORY_ACTIVITY_EVENTS);
     }
 
     #[instrument(skip(self, project), fields(project_id = %project.id, project_path = %project.path))]
@@ -923,21 +1116,62 @@ impl ProjectStore {
         }
     }
 
-    fn load_disk_cache(&mut self) {
-        let Some(ref dir) = self.cache_dir.clone() else {
+    fn init_duckdb_and_load(&mut self) {
+        let Some(ref db_path) = self.db_path.clone() else {
             return;
         };
+        if let Some(parent) = db_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
 
-        let cached_commits: Vec<CommitDto> = read_jsonl(&dir.join("commits.jsonl"));
-        for c in cached_commits {
+        let duckdb_bin = resolve_duckdb_binary();
+
+        if !db_path.exists() {
+            let init_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
+            let _ = Command::new(&duckdb_bin)
+                .env("MALLOC_ARENA_MAX", "1")
+                .arg("-dark-mode")
+                .arg("-batch")
+                .arg(db_path)
+                .arg("-c")
+                .arg(init_sql)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+
+        self.migrate_legacy_jsonl_if_needed(&duckdb_bin, db_path);
+        self.load_existing_rows(&duckdb_bin, db_path);
+        self.start_persistent_worker(&duckdb_bin, db_path);
+    }
+
+    fn load_existing_rows(&mut self, duckdb_bin: &Path, db_path: &Path) {
+        let init_sql = format!("CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}");
+        let _ = Command::new(duckdb_bin)
+            .env("MALLOC_ARENA_MAX", "1")
+            .arg("-dark-mode")
+            .arg("-batch")
+            .arg(db_path)
+            .arg("-c")
+            .arg(init_sql)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let commits_sql = format!(
+            "SELECT payload FROM (SELECT payload FROM commits ORDER BY rowid DESC LIMIT {MAX_IN_MEMORY_COMMITS});"
+        );
+        for c in query_payloads::<CommitDto>(duckdb_bin, db_path, &commits_sql) {
             if !c.id.is_empty() {
                 self.requested_commits.insert(c.id.clone());
                 self.commits.insert(c.id.clone(), c);
             }
         }
 
-        let cached_projects: Vec<Project> = read_jsonl(&dir.join("projects.jsonl"));
-        for p in cached_projects {
+        let projects_sql = format!(
+            "SELECT payload FROM (SELECT payload FROM projects ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS});"
+        );
+        for p in query_payloads::<Project>(duckdb_bin, db_path, &projects_sql) {
             if !self.project_id_lookup.contains_key(&p.id) {
                 self.project_id_lookup.insert(p.id, self.projects.len());
                 self.projects.push(p);
@@ -950,8 +1184,22 @@ impl ProjectStore {
             }
         }
 
-        let cached_events: Vec<ProjectActivityEvent> =
-            read_jsonl(&dir.join("activity_events.jsonl"));
+        let events_tail_scan = MAX_IN_MEMORY_ACTIVITY_EVENTS.saturating_mul(2);
+        let events_sql = format!(
+            "SELECT payload FROM (SELECT payload, created_at FROM activity_events ORDER BY rowid DESC LIMIT {events_tail_scan}) ORDER BY created_at DESC LIMIT {MAX_IN_MEMORY_ACTIVITY_EVENTS};"
+        );
+        let cached_events = query_payloads::<ProjectActivityEvent>(duckdb_bin, db_path, &events_sql);
+        self.ingest_cached_activity_events(cached_events);
+
+        info!(
+            projects = self.projects.len(),
+            commits = self.commits.len(),
+            activity_events = self.recent_activity.len(),
+            "Loaded cached GitLab state from DuckDB 2.0"
+        );
+    }
+
+    fn ingest_cached_activity_events(&mut self, cached_events: Vec<ProjectActivityEvent>) {
         let mut cached_event_counts: HashMap<ProjectId, usize> = HashMap::new();
         for mut ev in cached_events {
             if let Some(ref sha) = ev.commit_sha {
@@ -990,30 +1238,381 @@ impl ProjectStore {
         if !self.recent_activity.is_empty() {
             self.recent_activity
                 .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            self.recent_activity.truncate(MAX_IN_MEMORY_ACTIVITY_EVENTS);
             self.startup_notified = true;
         }
     }
 
-    fn save_projects_cache(&self) {
-        if let Some(ref dir) = self.cache_dir {
-            write_jsonl(&dir.join("projects.jsonl"), self.projects.iter());
-        }
-    }
+    fn migrate_legacy_jsonl_if_needed(&mut self, duckdb_bin: &Path, db_path: &Path) {
+        let Some(ref base_dir) = self.cache_dir.clone() else {
+            return;
+        };
 
-    fn save_activity_cache(&self) {
-        if let Some(ref dir) = self.cache_dir {
-            write_jsonl(
-                &dir.join("activity_events.jsonl"),
-                self.recent_activity.iter(),
+        for candidate_dir in [base_dir.clone(), base_dir.join("cache")] {
+            let commits_path = candidate_dir.join("commits.jsonl");
+            let projects_path = candidate_dir.join("projects.jsonl");
+            let events_path = candidate_dir.join("activity_events.jsonl");
+
+            if !commits_path.exists() && !projects_path.exists() && !events_path.exists() {
+                continue;
+            }
+
+            let mut statements: Vec<String> = Vec::new();
+
+            if commits_path.exists() {
+                let legacy_commits: Vec<CommitDto> = read_jsonl(&commits_path);
+                let mut seen_commits = HashSet::new();
+                for c in legacy_commits.into_iter().rev() {
+                    if !c.id.is_empty() && seen_commits.insert(c.id.clone()) {
+                        statements.push(upsert_commit_sql(&c));
+                    }
+                }
+            }
+
+            if projects_path.exists() {
+                let legacy_projects: Vec<Project> = read_jsonl(&projects_path);
+                for p in legacy_projects {
+                    statements.push(upsert_project_and_children_sql(&p));
+                }
+            }
+
+            if events_path.exists() {
+                let legacy_events: Vec<ProjectActivityEvent> = read_jsonl(&events_path);
+                let mut unique_by_id: HashMap<u64, ProjectActivityEvent> = HashMap::new();
+                for ev in legacy_events {
+                    unique_by_id.insert(ev.id, ev);
+                }
+                let mut deduped_events: Vec<ProjectActivityEvent> = unique_by_id.into_values().collect();
+                // Sort ascending before inserting so chronological tail matches rowid order in DuckDB
+                deduped_events.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                for ev in &deduped_events {
+                    statements.push(upsert_activity_sql(ev));
+                }
+            }
+
+            if statements.is_empty() {
+                continue;
+            }
+
+            let mut full_sql = format!(
+                "SET threads=1;\nSET external_threads=1;\nSET async_threads=1;\nSET memory_limit='64MB';\n{SCHEMA_SQL}\n"
             );
+            for chunk in statements.chunks(200) {
+                full_sql.push_str("BEGIN TRANSACTION;\n");
+                for stmt in chunk {
+                    full_sql.push_str(stmt);
+                }
+                full_sql.push_str("COMMIT;\n");
+            }
+            full_sql.push_str("CHECKPOINT;\n");
+
+            if let Ok(mut child) = Command::new(duckdb_bin)
+                .env("MALLOC_ARENA_MAX", "1")
+                .arg("-dark-mode")
+                .arg("-batch")
+                .arg(db_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(full_sql.as_bytes());
+                }
+                if let Ok(status) = child.wait() {
+                    if status.success() {
+                        if commits_path.exists() {
+                            let _ = fs::rename(&commits_path, candidate_dir.join("commits.jsonl.migrated"));
+                        }
+                        if projects_path.exists() {
+                            let _ = fs::rename(&projects_path, candidate_dir.join("projects.jsonl.migrated"));
+                        }
+                        if events_path.exists() {
+                            let _ = fs::rename(
+                                &events_path,
+                                candidate_dir.join("activity_events.jsonl.migrated"),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
-    fn save_commits_cache(&self) {
-        if let Some(ref dir) = self.cache_dir {
-            write_jsonl(&dir.join("commits.jsonl"), self.commits.values());
+    fn start_persistent_worker(&mut self, duckdb_bin: &Path, db_path: &Path) {
+        let mut child: Child = match Command::new(duckdb_bin)
+            .env("MALLOC_ARENA_MAX", "1")
+            .arg("-dark-mode")
+            .arg("-batch")
+            .arg(db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "Failed to spawn persistent DuckDB 2.0 worker");
+                return;
+            }
+        };
+
+        let mut stdin: ChildStdin = match child.stdin.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let stdout = child.stdout.take();
+
+        let _ = writeln!(
+            stdin,
+            "CHECKPOINT;\n{DUCKDB_LOW_MEMORY_SQL}\n{SCHEMA_SQL}"
+        );
+
+        let mut quack_listen_uri = None;
+        let mut quack_token = None;
+
+        #[cfg(test)]
+        let enable_quack = false;
+        #[cfg(not(test))]
+        let enable_quack = self.config.quack_server_enabled;
+
+        if enable_quack {
+            let uri = format!("quack:127.0.0.1:{}", self.config.quack_port);
+            let token = load_or_create_quack_token();
+            let init_quack_sql = format!(
+                "INSTALL quack;\nLOAD quack;\nCALL quack_serve('{}', token => '{}');\nSELECT 'GLIM_QUACK_DONE';\n",
+                sql_escape(&uri),
+                sql_escape(&token)
+            );
+            if writeln!(stdin, "{init_quack_sql}").is_ok() && stdin.flush().is_ok() {
+                if let Some(out) = stdout {
+                    let mut reader = BufReader::new(out);
+                    let mut line = String::new();
+                    let mut started_ok = false;
+                    while let Ok(n) = reader.read_line(&mut line) {
+                        if n == 0 {
+                            break;
+                        }
+                        if line.contains(&uri) {
+                            started_ok = true;
+                        }
+                        if line.contains("GLIM_QUACK_DONE") {
+                            break;
+                        }
+                        line.clear();
+                    }
+                    thread::spawn(move || {
+                        let mut sink = String::new();
+                        while let Ok(n) = reader.read_line(&mut sink) {
+                            if n == 0 {
+                                break;
+                            }
+                            sink.clear();
+                        }
+                    });
+
+                    if started_ok {
+                        info!(uri = %uri, "Started DuckDB 2.0 Quack protocol server");
+                        quack_listen_uri = Some(uri.into());
+                        quack_token = Some(token);
+                    }
+                }
+            }
+        } else if let Some(out) = stdout {
+            thread::spawn(move || {
+                let mut reader = BufReader::new(out);
+                let mut sink = String::new();
+                while let Ok(n) = reader.read_line(&mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.clear();
+                }
+            });
+        }
+
+        let (sql_tx, sql_rx) = mpsc::channel::<SqlWorkerMsg>();
+        thread::spawn(move || {
+            let mut ack_on_exit = None;
+            while let Ok(msg) = sql_rx.recv() {
+                match msg {
+                    SqlWorkerMsg::Execute(sql) => {
+                        if writeln!(stdin, "{sql}").is_err() {
+                            break;
+                        }
+                        let _ = stdin.flush();
+                    },
+                    SqlWorkerMsg::Shutdown(ack) => {
+                        let _ = writeln!(stdin, "CHECKPOINT;");
+                        let _ = stdin.flush();
+                        ack_on_exit = Some(ack);
+                        break;
+                    },
+                }
+            }
+            drop(stdin);
+            let _ = child.wait();
+            if let Some(ack) = ack_on_exit {
+                let _ = ack.send(());
+            }
+        });
+
+        self.duckdb_handle = Some(DuckDbHandle {
+            sql_tx,
+            quack_listen_uri,
+            quack_token,
+        });
+    }
+
+    fn persist_sql(&self, sql: String) {
+        if let Some(ref handle) = self.duckdb_handle {
+            handle.execute_async(sql);
         }
     }
+
+    fn save_projects_cache(&self) {
+        if self.duckdb_handle.is_none() {
+            return;
+        }
+        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        for p in &self.projects {
+            sql.push_str(&upsert_project_and_children_sql(p));
+        }
+        sql.push_str("COMMIT;\n");
+        self.persist_sql(sql);
+    }
+}
+
+impl Drop for ProjectStore {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn upsert_project_and_children_sql(proj: &Project) -> String {
+    let payload = serde_json::to_string(proj).unwrap_or_default();
+    let pipeline_count = proj.pipelines.as_ref().map(|v| v.len()).unwrap_or(0);
+    let open_mr_count = proj.merge_requests.len();
+    let mut sql = format!(
+        "INSERT OR REPLACE INTO projects (id, path, default_branch, url, last_activity_at, pipeline_count, open_mr_count, payload) VALUES ({}, '{}', '{}', '{}', '{}', {}, {}, '{}');\n",
+        proj.id,
+        sql_escape(proj.path.as_str()),
+        sql_escape(proj.default_branch.as_str()),
+        sql_escape(proj.url.as_str()),
+        sql_escape(&proj.last_activity_at.to_rfc3339()),
+        pipeline_count,
+        open_mr_count,
+        sql_escape(&payload)
+    );
+    if let Some(ref pipelines) = proj.pipelines {
+        for p in pipelines {
+            let p_payload = serde_json::to_string(p).unwrap_or_default();
+            let status_str = serde_json::to_value(&p.status)
+                .ok()
+                .and_then(|v| v.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            sql.push_str(&format!(
+                "INSERT OR REPLACE INTO pipelines (id, project_id, project_path, status, source, branch, url, created_at, updated_at, payload) VALUES ({}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}');\n",
+                p.id.value(),
+                proj.id,
+                sql_escape(proj.path.as_str()),
+                sql_escape(&status_str),
+                sql_escape(p.source.to_string().as_str()),
+                sql_escape(p.branch.as_str()),
+                sql_escape(p.url.as_str()),
+                sql_escape(&p.created_at.to_rfc3339()),
+                sql_escape(&p.updated_at.to_rfc3339()),
+                sql_escape(&p_payload)
+            ));
+        }
+    }
+    for mr in &proj.merge_requests {
+        let mr_payload = serde_json::to_string(mr).unwrap_or_default();
+        sql.push_str(&format!(
+            "INSERT OR REPLACE INTO merge_requests (id, iid, project_id, project_path, title, state, source_branch, target_branch, draft, has_conflicts, blocking_discussions_resolved, upvotes, author_username, updated_at, url, payload) VALUES ({}, {}, {}, '{}', '{}', '{}', '{}', '{}', {}, {}, {}, {}, '{}', '{}', '{}', '{}');\n",
+            mr.id,
+            mr.iid,
+            proj.id,
+            sql_escape(proj.path.as_str()),
+            sql_escape(mr.title.as_str()),
+            sql_escape(mr.state.as_str()),
+            sql_escape(mr.source_branch.as_str()),
+            sql_escape(mr.target_branch.as_str()),
+            if mr.draft { "TRUE" } else { "FALSE" },
+            if mr.has_conflicts { "TRUE" } else { "FALSE" },
+            if mr.blocking_discussions_resolved { "TRUE" } else { "FALSE" },
+            mr.upvotes,
+            sql_escape(mr.author_username.as_str()),
+            sql_escape(&mr.updated_at.to_rfc3339()),
+            sql_escape(mr.url.as_str()),
+            sql_escape(&mr_payload)
+        ));
+    }
+    sql
+}
+
+fn upsert_activity_sql(ev: &ProjectActivityEvent) -> String {
+    let payload = serde_json::to_string(ev).unwrap_or_default();
+    format!(
+        "INSERT OR REPLACE INTO activity_events (id, project_id, project_name, kind, author, mr_iid, branch, commit_sha, summary, created_at, payload) VALUES ({}, {}, '{}', '{}', '{}', {}, {}, {}, '{}', '{}', '{}');\n",
+        ev.id,
+        ev.project_id,
+        sql_escape(ev.project_name.as_str()),
+        sql_escape(ev.kind.action_label()),
+        sql_escape(ev.author.as_str()),
+        sql_opt_u64(ev.mr_iid),
+        sql_opt_str(ev.branch.as_deref()),
+        sql_opt_str(ev.commit_sha.as_deref()),
+        sql_escape(ev.summary.as_str()),
+        sql_escape(&ev.created_at.to_rfc3339()),
+        sql_escape(&payload)
+    )
+}
+
+fn upsert_commit_sql(c: &CommitDto) -> String {
+    let payload = serde_json::to_string(c).unwrap_or_default();
+    format!(
+        "INSERT OR REPLACE INTO commits (id, title, author_name, message, payload) VALUES ('{}', '{}', '{}', '{}', '{}');\n",
+        sql_escape(c.id.as_str()),
+        sql_escape(c.title.as_str()),
+        sql_escape(c.author_name.as_str()),
+        sql_escape(c.message.as_str()),
+        sql_escape(&payload)
+    )
+}
+
+fn query_payloads<T: DeserializeOwned>(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Vec<T> {
+    let full_sql = format!("{DUCKDB_LOW_MEMORY_SQL}\n{sql}");
+    let Ok(out) = Command::new(duckdb_bin)
+        .env("MALLOC_ARENA_MAX", "1")
+        .arg("-dark-mode")
+        .arg("-readonly")
+        .arg("-batch")
+        .arg("-json")
+        .arg(db_path)
+        .arg("-c")
+        .arg(full_sql)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&out.stdout) else {
+        return Vec::new();
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let payload_str = row.get("payload")?.as_str()?;
+            serde_json::from_str::<T>(payload_str).ok()
+        })
+        .collect()
 }
 
 fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
@@ -1026,30 +1625,6 @@ fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| serde_json::from_str::<T>(&line).ok())
         .collect()
-}
-
-fn write_jsonl<'a, T: Serialize + 'a>(path: &Path, items: impl IntoIterator<Item = &'a T>) {
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let tmp_path = path.with_extension("jsonl.tmp");
-    let Ok(file) = File::create(&tmp_path) else {
-        return;
-    };
-    let mut writer = BufWriter::new(file);
-    for item in items {
-        if serde_json::to_writer(&mut writer, item).is_err() {
-            return;
-        }
-        if writer.write_all(b"\n").is_err() {
-            return;
-        }
-    }
-    if writer.flush().is_ok() {
-        let _ = fs::rename(&tmp_path, path);
-    }
 }
 
 fn mr_full_body(project: &Project, mr_iid: Option<u64>, title: &CompactString) -> CompactString {
@@ -1661,6 +2236,7 @@ mod tests {
             ProjectId::new(24),
             vec![comment],
         ));
+        store.shutdown();
 
         let reloaded = ProjectStore::with_cache_dir(tx, &config, Some(tmp_dir.clone()));
         assert_eq!(reloaded.sorted_projects().len(), 1);

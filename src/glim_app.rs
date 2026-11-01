@@ -74,6 +74,10 @@ pub const fn default_urgency_normal() -> NotifyUrgency {
     NotifyUrgency::Normal
 }
 
+pub const fn default_quack_port() -> u16 {
+    9497
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GlimConfig {
     /// The URL of the GitLab instance
@@ -192,6 +196,12 @@ pub struct GlimConfig {
     /// Number of lines in the bottom MR & repo activity feed panel (0 to hide, default: 6)
     #[serde(default = "default_activity_feed_lines")]
     pub activity_feed_lines: u16,
+    /// Enable DuckDB 2.0 Quack protocol server for concurrent CLI queries (default: true)
+    #[serde(default = "default_true")]
+    pub quack_server_enabled: bool,
+    /// Port for the DuckDB 2.0 Quack protocol server (default: 9497)
+    #[serde(default = "default_quack_port")]
+    pub quack_port: u16,
 }
 
 impl Default for GlimConfig {
@@ -237,6 +247,8 @@ impl Default for GlimConfig {
             projects_poll_seconds: default_projects_poll_seconds(),
             jobs_poll_seconds: default_jobs_poll_seconds(),
             activity_feed_lines: default_activity_feed_lines(),
+            quack_server_enabled: true,
+            quack_port: default_quack_port(),
         }
     }
 }
@@ -289,7 +301,10 @@ impl GlimApp {
         self.project_store.apply(&event);
 
         match event {
-            GlimEvent::AppExit => self.running = false,
+            GlimEvent::AppExit => {
+                self.project_store.shutdown();
+                self.running = false;
+            },
 
             // www
             GlimEvent::ProjectOpenUrl(id) => {
