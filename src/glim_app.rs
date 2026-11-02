@@ -78,7 +78,85 @@ pub const fn default_quack_port() -> u16 {
     9497
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub const fn default_stochastic_temperature() -> f64 {
+    0.75
+}
+
+pub const fn default_stochastic_ratio() -> f64 {
+    0.35
+}
+
+pub const fn default_stochastic_rotation_seconds() -> u64 {
+    90
+}
+
+pub const fn default_event_half_life_hours() -> f64 {
+    18.0
+}
+
+pub const fn default_age_half_life_hours() -> f64 {
+    36.0
+}
+
+pub const fn default_interaction_half_life_hours() -> f64 {
+    24.0
+}
+
+pub const fn default_interaction_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CiViewMode {
+    /// Group ranked CI processes and open MRs inside repository rows.
+    #[default]
+    Grouped,
+    /// List ranked CI processes and open MRs as first-class 1-line rows across repositories.
+    Flat,
+}
+
+impl CiViewMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Grouped => Self::Flat,
+            Self::Flat => Self::Grouped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RankingMode {
+    /// Hybrid ranking: pins urgent items (running pipelines, recent failures/conflicts, default branch)
+    /// and fills remaining slots using relevance + Gumbel-Top-k stochastic exploration.
+    #[default]
+    Hybrid,
+    /// 100% Stochastic Plackett-Luce / Gumbel-Top-k sampling across all candidates weighted by relevance score.
+    Stochastic,
+    /// Pure deterministic relevance score ordering with zero randomness.
+    Deterministic,
+}
+
+impl RankingMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Hybrid => Self::Stochastic,
+            Self::Stochastic => Self::Deterministic,
+            Self::Deterministic => Self::Hybrid,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Stochastic => "100% stochastic",
+            Self::Deterministic => "deterministic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GlimConfig {
     /// The URL of the GitLab instance
     pub gitlab_url: CompactString,
@@ -202,6 +280,46 @@ pub struct GlimConfig {
     /// Port for the DuckDB 2.0 Quack protocol server (default: 9497)
     #[serde(default = "default_quack_port")]
     pub quack_port: u16,
+    /// Enable stochastic & Hawkes relevance ranking, dead-branch pruning, stacked MR compaction,
+    /// soft include_projects auto-wakeup, and proportional per-project row allocation (default: true)
+    #[serde(default = "default_true")]
+    pub dynamic_relevance: bool,
+    /// Enable focus-driven split window between CI projects table and activity feed (default: true)
+    #[serde(default = "default_true")]
+    pub dynamic_split: bool,
+    /// Default view mode for the CI pane: "grouped" (by repository) or "flat" (first-class CI process rows)
+    #[serde(default)]
+    pub ci_view_mode: CiViewMode,
+    /// Relevance ranking mode: "hybrid" (default), "stochastic" (100% Gumbel-Top-k), or "deterministic"
+    #[serde(default)]
+    pub ranking_mode: RankingMode,
+    /// Temperature tau for Gumbel-Max stochastic sampling (default: 0.75; higher = more exploratory)
+    #[serde(default = "default_stochastic_temperature")]
+    pub stochastic_temperature: f64,
+    /// Fraction of non-urgent slots sampled stochastically in hybrid mode (0.0..=1.0, default: 0.35)
+    #[serde(default = "default_stochastic_ratio")]
+    pub stochastic_ratio: f64,
+    /// Time bucket in seconds before the stochastic Gumbel seed rotates automatically (default: 90)
+    #[serde(default = "default_stochastic_rotation_seconds")]
+    pub stochastic_rotation_seconds: u64,
+    /// Half-life in hours for GitLab activity event Hawkes excitation (default: 18.0)
+    #[serde(default = "default_event_half_life_hours")]
+    pub event_half_life_hours: f64,
+    /// Half-life in hours for branch/MR age decay (default: 36.0)
+    #[serde(default = "default_age_half_life_hours")]
+    pub age_half_life_hours: f64,
+    /// Half-life in hours for user interaction Hawkes excitation (default: 24.0)
+    #[serde(default = "default_interaction_half_life_hours")]
+    pub interaction_half_life_hours: f64,
+    /// Weight multiplier for user interactions in relevance scoring (default: 1.0; 0.0 to disable)
+    #[serde(default = "default_interaction_weight")]
+    pub interaction_weight: f64,
+    /// Compact stacked MR chains into a single row with (+N stacked: !first..!last) badge (default: true)
+    #[serde(default = "default_true")]
+    pub compact_stacked_mrs: bool,
+    /// Prune non-default branches with no open MR that have been merged/closed or completed >6h ago (default: true)
+    #[serde(default = "default_true")]
+    pub prune_merged_branches: bool,
 }
 
 impl Default for GlimConfig {
@@ -249,6 +367,19 @@ impl Default for GlimConfig {
             activity_feed_lines: default_activity_feed_lines(),
             quack_server_enabled: true,
             quack_port: default_quack_port(),
+            dynamic_relevance: true,
+            dynamic_split: true,
+            ci_view_mode: CiViewMode::default(),
+            ranking_mode: RankingMode::default(),
+            stochastic_temperature: default_stochastic_temperature(),
+            stochastic_ratio: default_stochastic_ratio(),
+            stochastic_rotation_seconds: default_stochastic_rotation_seconds(),
+            event_half_life_hours: default_event_half_life_hours(),
+            age_half_life_hours: default_age_half_life_hours(),
+            interaction_half_life_hours: default_interaction_half_life_hours(),
+            interaction_weight: default_interaction_weight(),
+            compact_stacked_mrs: true,
+            prune_merged_branches: true,
         }
     }
 }
@@ -302,7 +433,6 @@ impl GlimApp {
 
         match event {
             GlimEvent::AppExit => {
-                self.project_store.shutdown();
                 self.running = false;
             },
 
@@ -380,7 +510,7 @@ impl GlimApp {
                     .filter(|p| p.status.is_active() || p.has_active_jobs())
                     .for_each(|p| self.gitlab.spawn_fetch_jobs(p.project_id, p.id));
             },
-            GlimEvent::PipelinesFetch(id) => {
+            GlimEvent::PipelinesFetch(id) | GlimEvent::ProjectManualRefresh(id) => {
                 debug!(project_id = %id, "Requesting pipelines, MRs, and events for project");
                 self.gitlab.spawn_fetch_pipelines(id, None);
                 self.gitlab.spawn_fetch_merge_requests(id);
@@ -574,12 +704,42 @@ impl GlimApp {
         self.project_store.is_loading_more_activity()
     }
 
+    pub fn current_username(&self) -> &str {
+        self.project_store.current_username()
+    }
+
+    pub fn user_interactions(&self) -> &[crate::domain::UserInteraction] {
+        self.project_store.user_interactions()
+    }
+
+    #[allow(dead_code)]
     pub fn filtered_projects(
         &self,
         temporary_filter: &Option<CompactString>,
     ) -> (Vec<Project>, Vec<usize>) {
+        self.filtered_projects_with_mode(temporary_filter, self.config.ranking_mode, 0)
+    }
+
+    pub fn filtered_projects_with_mode(
+        &self,
+        temporary_filter: &Option<CompactString>,
+        ranking_mode: RankingMode,
+        stochastic_nonce: u64,
+    ) -> (Vec<Project>, Vec<usize>) {
         let all_projects = self.project_store.sorted_projects();
         let now = chrono::Utc::now();
+        let events = self.project_store.recent_activity();
+        let interactions = self.project_store.user_interactions();
+        let username = self.project_store.current_username();
+        let ctx = crate::relevance::RelevanceContext {
+            activity_events: events,
+            user_interactions: interactions,
+            current_username: username,
+            config: &self.config,
+            ranking_mode,
+            stochastic_nonce,
+            now,
+        };
 
         let search_terms: Vec<String> = temporary_filter
             .as_ref()
@@ -615,8 +775,7 @@ impl GlimApp {
             })
             .unwrap_or_default();
 
-        let mut filtered_projects = Vec::new();
-        let mut filtered_indices = Vec::new();
+        let mut scored_matches: Vec<(Project, usize, f64, bool)> = Vec::new();
 
         for (index, project) in all_projects.iter().enumerate() {
             // 1. Check max_age_days cutoff
@@ -646,17 +805,9 @@ impl GlimApp {
                 continue;
             }
 
-            // 3. Check include_projects allowlist
-            if !include_terms.is_empty()
-                && !include_terms
-                    .iter()
-                    .any(|term| path_lower.contains(term.as_str()))
-            {
-                continue;
-            }
-
-            // 4. Check search_filter / temporary_filter (supports comma-separated terms)
-            if !search_terms.is_empty() {
+            // 3. Check search_filter / temporary_filter (supports comma-separated terms)
+            let has_explicit_search = !search_terms.is_empty();
+            if has_explicit_search {
                 let matches_search = search_terms.iter().any(|term| {
                     path_lower.contains(term.as_str())
                         || desc_lower
@@ -668,8 +819,55 @@ impl GlimApp {
                 }
             }
 
-            filtered_projects.push(project.clone());
-            filtered_indices.push(index);
+            // 4. Check include_projects allowlist + dynamic auto-wakeup
+            let is_pinned = include_terms.is_empty()
+                || include_terms
+                    .iter()
+                    .any(|term| path_lower.contains(term.as_str()));
+
+            let (heat, should_show) = if self.config.dynamic_relevance {
+                crate::relevance::compute_project_heat(project, &ctx)
+            } else {
+                (0.0, is_pinned)
+            };
+
+            if !has_explicit_search && !should_show {
+                continue;
+            }
+
+            scored_matches.push((project.clone(), index, heat, is_pinned));
+        }
+
+        if self.config.dynamic_relevance {
+            if ranking_mode == RankingMode::Stochastic {
+                let tau = self.config.stochastic_temperature.clamp(0.15, 3.0);
+                scored_matches.sort_by(|(pa, _, ha, _), (pb, _, hb, _)| {
+                    let ga = ha.max(0.5).ln()
+                        + tau * crate::relevance::project_gumbel_noise(&ctx, pa.id);
+                    let gb = hb.max(0.5).ln()
+                        + tau * crate::relevance::project_gumbel_noise(&ctx, pb.id);
+                    gb.partial_cmp(&ga)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| pb.last_activity_at.cmp(&pa.last_activity_at))
+                });
+            } else {
+                scored_matches.sort_by(|(pa, _, ha, pin_a), (pb, _, hb, pin_b)| {
+                    let a_active = pa.has_active_pipelines();
+                    let b_active = pb.has_active_pipelines();
+                    b_active
+                        .cmp(&a_active)
+                        .then_with(|| pin_b.cmp(pin_a))
+                        .then_with(|| hb.partial_cmp(ha).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| pb.last_activity_at.cmp(&pa.last_activity_at))
+                });
+            }
+        }
+
+        let mut filtered_projects = Vec::with_capacity(scored_matches.len());
+        let mut filtered_indices = Vec::with_capacity(scored_matches.len());
+        for (proj, idx, _, _) in scored_matches {
+            filtered_projects.push(proj);
+            filtered_indices.push(idx);
         }
 
         (filtered_projects, filtered_indices)
@@ -681,6 +879,10 @@ impl GlimApp {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    pub fn shutdown(&mut self) {
+        self.project_store.shutdown();
     }
 
     pub fn pop_notice(&mut self) -> Option<Notice> {

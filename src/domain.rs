@@ -150,6 +150,68 @@ pub struct ProjectActivityEvent {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInteractionKind {
+    SelectProject,
+    InspectProjectDetails,
+    InspectPipelineActions,
+    InspectActivityDetails,
+    OpenProjectWeb,
+    OpenMergeRequestWeb,
+    OpenPipelineWeb,
+    OpenJobWeb,
+    OpenCommitWeb,
+    DownloadJobLog,
+    ManualRefresh,
+}
+
+impl UserInteractionKind {
+    pub fn base_weight(self) -> f64 {
+        match self {
+            Self::DownloadJobLog => 26.0,
+            Self::OpenJobWeb => 24.0,
+            Self::OpenMergeRequestWeb => 22.0,
+            Self::OpenPipelineWeb => 18.0,
+            Self::InspectPipelineActions => 16.0,
+            Self::ManualRefresh => 15.0,
+            Self::OpenCommitWeb => 14.0,
+            Self::InspectProjectDetails => 12.0,
+            Self::InspectActivityDetails => 12.0,
+            Self::OpenProjectWeb => 10.0,
+            Self::SelectProject => 2.5,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SelectProject => "select_project",
+            Self::InspectProjectDetails => "inspect_project_details",
+            Self::InspectPipelineActions => "inspect_pipeline_actions",
+            Self::InspectActivityDetails => "inspect_activity_details",
+            Self::OpenProjectWeb => "open_project_web",
+            Self::OpenMergeRequestWeb => "open_mr_web",
+            Self::OpenPipelineWeb => "open_pipeline_web",
+            Self::OpenJobWeb => "open_job_web",
+            Self::OpenCommitWeb => "open_commit_web",
+            Self::DownloadJobLog => "download_job_log",
+            Self::ManualRefresh => "manual_refresh",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserInteraction {
+    pub id: u64,
+    pub project_id: ProjectId,
+    pub mr_iid: Option<u64>,
+    pub branch: Option<CompactString>,
+    pub pipeline_id: Option<PipelineId>,
+    pub kind: UserInteractionKind,
+    pub weight: f64,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
     pub id: PipelineId,
@@ -637,6 +699,9 @@ impl Project {
         self.merge_requests
             .iter()
             .find(|mr| mr.source_branch == branch)
+            .or_else(|| {
+                crate::relevance::parse_mr_ref_iid(branch).and_then(|iid| self.merge_request(iid))
+            })
     }
 
     pub fn merge_request(&self, iid: u64) -> Option<&MergeRequest> {
@@ -902,87 +967,91 @@ pub fn parse_row<'a>(
     max_pipelines: usize,
     include_mr_pipelines: bool,
 ) -> Row<'a> {
-    let max_rows = max_pipelines.max(1);
-    let distinct_by_branch = project.first_pipeline_per_branch(
-        max_rows,
+    let config = crate::glim_app::GlimConfig {
+        max_pipelines_per_project: max_pipelines,
         include_mr_pipelines,
-        |p| p.status.is_active(),
-    );
-
-    let pipeline_to_span = |p: &'a Pipeline| -> Line<'a> {
-        let icon = p.status.icon();
-        let branch = p.branch.as_str();
-
-        let updated_at = p.updated_at.with_timezone(&Local);
-        let mut spans = crate::ui::format_timestamp_spans(updated_at);
-        spans.push(Span::from(" "));
-
-        match () {
-            _ if p.has_active_jobs() => {
-                spans.extend([
-                    Span::from(p.jobs.as_ref().unwrap().icon()),
-                    Span::from(" "),
-                    Span::from(branch).style(theme().pipeline_branch),
-                    Span::from(" "),
-                    Span::from(p.active_job_name()).style(theme().pipeline_job),
-                    Span::from(" "),
-                    Span::from(format_duration(p.duration())).style(theme().time),
-                ]);
-            },
-            _ if p.status.is_active() => {
-                spans.extend([
-                    Span::from(icon),
-                    Span::from(" "),
-                    Span::from(branch).style(theme().pipeline_branch),
-                    Span::from(" "),
-                    Span::from(format_duration(p.duration())).style(theme().time),
-                ]);
-            },
-            _ => {
-                spans.extend([
-                    Span::from(icon),
-                    Span::from(" "),
-                    Span::from(branch).style(theme().pipeline_branch),
-                ]);
-            },
-        }
-
-        if let Some(mr) = project.merge_request_for_branch(branch) {
-            append_mr_spans(&mut spans, mr, &project.default_branch);
-        }
-
-        Line::from(spans)
+        dynamic_relevance: false,
+        ..Default::default()
     };
+    let ctx = crate::relevance::RelevanceContext::new(&config, &[], &[], "", Utc::now());
+    parse_ranked_row(project, &ctx, max_pipelines, false)
+}
 
-    let mut pipeline_spans: Vec<Line<'a>> = distinct_by_branch
-        .iter()
-        .map(|p| pipeline_to_span(p))
-        .collect();
+pub fn parse_ranked_row<'a>(
+    project: &'a Project,
+    ctx: &crate::relevance::RelevanceContext<'_>,
+    max_pipelines: usize,
+    compact_mode: bool,
+) -> Row<'a> {
+    let entries = crate::relevance::rank_project_entries(project, ctx, max_pipelines.max(1));
 
-    // If there are open MRs whose source_branch did not appear in the recent pipelines list,
-    // fill remaining slots up to `max_rows` so open MRs are always visible.
-    if pipeline_spans.len() < max_rows && !project.merge_requests.is_empty() {
-        for mr in &project.merge_requests {
-            if pipeline_spans.len() >= max_rows {
-                break;
-            }
-            let already_shown = distinct_by_branch
-                .iter()
-                .any(|p| p.branch == mr.source_branch);
-            if !already_shown {
+    let pipeline_spans: Vec<Line<'a>> = entries
+        .into_iter()
+        .map(|entry| {
+            let stacked_badge = entry.stacked_badge();
+            let branch = entry.branch;
+            let mut spans = if let Some(p) = entry.pipeline {
+                let icon = p.status.icon();
+                let updated_at = p.updated_at.with_timezone(&Local);
+                let mut s = crate::ui::format_timestamp_spans(updated_at);
+                s.push(Span::from(" "));
+
+                match () {
+                    _ if p.has_active_jobs() => {
+                        s.extend([
+                            Span::from(p.jobs.as_ref().unwrap().icon()),
+                            Span::from(" "),
+                            Span::from(branch).style(theme().pipeline_branch),
+                            Span::from(" "),
+                            Span::from(p.active_job_name()).style(theme().pipeline_job),
+                            Span::from(" "),
+                            Span::from(format_duration(p.duration())).style(theme().time),
+                        ]);
+                    },
+                    _ if p.status.is_active() => {
+                        s.extend([
+                            Span::from(icon),
+                            Span::from(" "),
+                            Span::from(branch).style(theme().pipeline_branch),
+                            Span::from(" "),
+                            Span::from(format_duration(p.duration())).style(theme().time),
+                        ]);
+                    },
+                    _ => {
+                        s.extend([
+                            Span::from(icon),
+                            Span::from(" "),
+                            Span::from(branch).style(theme().pipeline_branch),
+                        ]);
+                    },
+                }
+                s
+            } else if let Some(mr) = entry.mr {
                 let updated_at = mr.updated_at.with_timezone(&Local);
-                let mut spans = crate::ui::format_timestamp_spans(updated_at);
-                spans.push(Span::from(" 🟣 "));
-                spans.push(Span::from(mr.source_branch.as_str()).style(theme().pipeline_branch));
+                let mut s = crate::ui::format_timestamp_spans(updated_at);
+                s.push(Span::from(" 🟣 "));
+                s.push(Span::from(branch).style(theme().pipeline_branch));
+                s
+            } else {
+                Vec::new()
+            };
+
+            if let Some(mr) = entry.mr {
                 append_mr_spans(&mut spans, mr, &project.default_branch);
-                pipeline_spans.push(Line::from(spans));
             }
-        }
-    }
+
+            if let Some(badge) = stacked_badge {
+                spans.push(Span::from(" "));
+                spans.push(Span::from(badge).style(theme().mr_target));
+            }
+
+            Line::from(spans)
+        })
+        .collect();
 
     let last_activity = project.last_activity_at.with_timezone(&Local);
 
-    let open_mr_line = if !project.merge_requests.is_empty() {
+    let open_mr_line = if !project.merge_requests.is_empty() && !compact_mode {
         let conflicts = project
             .merge_requests
             .iter()
@@ -1024,7 +1093,8 @@ pub fn parse_row<'a>(
         },
     };
 
-    let row_height = (pipeline_spans.len() as u16).max(3);
+    let min_h = if compact_mode { 2 } else { 3 };
+    let row_height = (pipeline_spans.len() as u16).max(min_h);
 
     Row::new(vec![
         text_from(last_activity),
@@ -1034,7 +1104,80 @@ pub fn parse_row<'a>(
     .height(row_height)
 }
 
-#[derive(Clone, Debug)]
+/// Formats a single first-class CI process / MR entry as a 1-line table row (similar to the activity feed).
+pub fn parse_flat_ci_row<'a>(item: &crate::relevance::RankedCiProcessEntry<'a>) -> Row<'a> {
+    let project = item.project;
+    let entry = &item.entry;
+    let stacked_badge = entry.stacked_badge();
+    let local_ts = item.updated_at.with_timezone(&Local);
+    let mut spans = crate::ui::format_timestamp_spans(local_ts);
+    spans.push(Span::from(" "));
+
+    if let Some(p) = entry.pipeline {
+        let icon = if p.has_active_jobs() {
+            p.jobs.as_ref().unwrap().icon()
+        } else {
+            p.status.icon()
+        };
+        spans.push(Span::from(icon));
+    } else {
+        spans.push(Span::from("🟣"));
+    }
+
+    spans.push(Span::from(" "));
+    spans.push(Span::from(format!("[{}]", project.path)).style(theme().project_parents));
+    spans.push(Span::from(" "));
+    spans.push(Span::from(entry.branch.clone()).style(theme().pipeline_branch));
+
+    if let Some(p) = entry.pipeline {
+        if p.has_active_jobs() {
+            let job_name = p.active_job_name();
+            if !job_name.is_empty() {
+                spans.push(Span::from(format!(" ⚙ {job_name}")).style(theme().pipeline_job));
+            }
+            spans.push(Span::from(format!(" {}", format_duration(p.duration()))).style(theme().time));
+        } else if p.status.is_active() {
+            spans.push(Span::from(format!(" {}", format_duration(p.duration()))).style(theme().time));
+        } else if p.status == PipelineStatus::Failed {
+            if let Some(failed_job) = p.failing_job_name() {
+                spans.push(Span::from(format!(" ✗ {failed_job}")).style(theme().mr_conflict));
+            }
+            spans.push(Span::from(format!(" ({})", format_duration(p.duration()))).style(theme().time));
+        } else {
+            spans.push(Span::from(format!(" ({})", format_duration(p.duration()))).style(theme().time));
+        }
+    }
+
+    if let Some(mr) = entry.mr {
+        append_mr_spans(&mut spans, mr, &project.default_branch);
+    }
+
+    if let Some(badge) = stacked_badge {
+        spans.push(Span::from(" "));
+        spans.push(Span::from(badge).style(theme().mr_target));
+    }
+
+    let summary_opt = entry
+        .mr
+        .map(|mr| mr.title.as_str())
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            entry
+                .pipeline
+                .and_then(|p| p.commit.as_ref())
+                .map(|c| c.title.as_str())
+                .filter(|t| !t.is_empty())
+        });
+
+    if let Some(summary) = summary_opt {
+        spans.push(Span::from(" — ").style(theme().date));
+        spans.push(Span::from(summary).style(theme().commit_title));
+    }
+
+    Row::new(vec![Text::from(Line::from(spans))]).height(1)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowEntryTarget {
     MergeRequest(u64),
     Pipeline(PipelineId),
@@ -1048,39 +1191,26 @@ impl Project {
         max_pipelines: usize,
         include_mr_pipelines: bool,
     ) -> (Vec<RowEntryTarget>, u16) {
-        let max_rows = max_pipelines.max(1);
-        let distinct_by_branch = self.first_pipeline_per_branch(
-            max_rows,
+        let config = crate::glim_app::GlimConfig {
+            max_pipelines_per_project: max_pipelines,
             include_mr_pipelines,
-            |p| p.status.is_active(),
-        );
+            dynamic_relevance: false,
+            ..Default::default()
+        };
+        let ctx = crate::relevance::RelevanceContext::new(&config, &[], &[], "", Utc::now());
+        self.ranked_targets_and_height(&ctx, max_pipelines, false)
+    }
 
-        let mut targets: Vec<RowEntryTarget> = distinct_by_branch
-            .iter()
-            .map(|p| {
-                if let Some(mr) = self.merge_request_for_branch(&p.branch) {
-                    RowEntryTarget::MergeRequest(mr.iid)
-                } else {
-                    RowEntryTarget::Pipeline(p.id)
-                }
-            })
-            .collect();
-
-        if targets.len() < max_rows && !self.merge_requests.is_empty() {
-            for mr in &self.merge_requests {
-                if targets.len() >= max_rows {
-                    break;
-                }
-                let already_shown = distinct_by_branch
-                    .iter()
-                    .any(|p| p.branch == mr.source_branch);
-                if !already_shown {
-                    targets.push(RowEntryTarget::MergeRequest(mr.iid));
-                }
-            }
-        }
-
-        let row_height = (targets.len() as u16).max(3);
+    pub fn ranked_targets_and_height(
+        &self,
+        ctx: &crate::relevance::RelevanceContext<'_>,
+        max_pipelines: usize,
+        compact_mode: bool,
+    ) -> (Vec<RowEntryTarget>, u16) {
+        let entries = crate::relevance::rank_project_entries(self, ctx, max_pipelines.max(1));
+        let targets: Vec<RowEntryTarget> = entries.into_iter().map(|e| e.target).collect();
+        let min_h = if compact_mode { 2 } else { 3 };
+        let row_height = (targets.len() as u16).max(min_h);
         (targets, row_height)
     }
 }

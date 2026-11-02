@@ -4,8 +4,8 @@ use compact_str::ToCompactString;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::{
-    dispatcher::Dispatcher, event::GlimEvent, id::ProjectId, input::InputProcessor,
-    ui::StatefulWidgets,
+    dispatcher::Dispatcher, domain::RowEntryTarget, event::GlimEvent, id::ProjectId,
+    input::InputProcessor, ui::StatefulWidgets,
 };
 
 pub struct NormalModeProcessor {
@@ -20,10 +20,21 @@ impl NormalModeProcessor {
 
     fn process(&self, event: &KeyEvent, ui: &StatefulWidgets) {
         let feed_focused = ui.activity_feed_focused && ui.show_activity_feed;
+        let flat_active = !ui.current_flat_targets.is_empty();
         if let Some(e) = match event.code {
             KeyCode::Tab | KeyCode::BackTab => Some(GlimEvent::FocusToggle),
+            KeyCode::Char('v') => Some(GlimEvent::ToggleCiViewMode),
+            KeyCode::Char('s') => Some(GlimEvent::CycleRankingMode),
+            KeyCode::Char('S') => Some(GlimEvent::RerollStochastic),
             KeyCode::Enter | KeyCode::Char('o') if feed_focused => {
                 ui.selected_activity_id.map(GlimEvent::ActivityDetailsOpen)
+            },
+            KeyCode::Enter | KeyCode::Char('o') if flat_active => {
+                if let Some((proj_id, _, Some(pid))) = ui.selected_flat_target {
+                    Some(GlimEvent::ProjectDetailsOpenWithPipeline(proj_id, pid))
+                } else {
+                    self.selected.map(GlimEvent::ProjectDetailsOpen)
+                }
             },
             KeyCode::Enter if self.selected.is_some() => {
                 Some(GlimEvent::ProjectDetailsOpen(self.selected.unwrap()))
@@ -36,9 +47,28 @@ impl NormalModeProcessor {
             KeyCode::Char('f') => Some(GlimEvent::FilterMenuShow),
             KeyCode::Char('/') => Some(GlimEvent::FilterMenuShow),
             KeyCode::Char('m') => Some(GlimEvent::ToggleActivityFeed),
-            KeyCode::Char('p') => self.selected.map(GlimEvent::PipelinesFetch),
+            KeyCode::Char('p') => {
+                if let Some(proj_id) = self.selected {
+                    self.dispatch(GlimEvent::ProjectManualRefresh(proj_id));
+                    Some(GlimEvent::PipelinesFetch(proj_id))
+                } else {
+                    None
+                }
+            },
             KeyCode::Char('q') => Some(GlimEvent::AppExit),
             KeyCode::Char('r') => Some(GlimEvent::ProjectsFetch),
+            KeyCode::Char('w') if flat_active => {
+                if let Some((proj_id, ref target, _)) = ui.selected_flat_target {
+                    Some(match target {
+                        RowEntryTarget::MergeRequest(iid) => {
+                            GlimEvent::MergeRequestOpenUrl(proj_id, *iid)
+                        },
+                        RowEntryTarget::Pipeline(pid) => GlimEvent::PipelineOpenUrl(proj_id, *pid),
+                    })
+                } else {
+                    self.selected.map(GlimEvent::ProjectOpenUrl)
+                }
+            },
             KeyCode::Char('w') => self.selected.map(GlimEvent::ProjectOpenUrl),
             KeyCode::F(12) => Some(GlimEvent::ScreenCapture),
             KeyCode::Up | KeyCode::Char('k') if feed_focused => Some(GlimEvent::ActivityPrevious),

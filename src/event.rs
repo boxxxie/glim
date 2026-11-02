@@ -55,6 +55,8 @@ pub enum GlimEvent {
     FilterMenuClose,
     FilterMenuShow,
     FocusToggle,
+    CycleRankingMode,
+    RerollStochastic,
     #[allow(dead_code)]
     GlitchOverride(GlitchState),
     InputKey(KeyEvent),
@@ -80,6 +82,7 @@ pub enum GlimEvent {
     PipelinesLoaded(Vec<PipelineDto>),
     ProjectDetailsClose,
     ProjectDetailsOpen(ProjectId),
+    ProjectDetailsOpenWithPipeline(ProjectId, PipelineId),
     ProjectEventsFetch(ProjectId),
     ProjectEventsLoaded(ProjectId, Vec<GitlabEventDto>),
     ProjectEventsPageFetch(ProjectId, u32),
@@ -88,6 +91,7 @@ pub enum GlimEvent {
     ProjectFetch(ProjectId),
     ProjectFirst,
     ProjectLast,
+    ProjectManualRefresh(ProjectId),
     ProjectNext,
     ProjectOpenUrl(ProjectId),
     ProjectPageDown,
@@ -101,6 +105,7 @@ pub enum GlimEvent {
     ScreenCaptureToClipboard(String),
     TodosLoaded(Vec<GitlabTodoDto>),
     ToggleActivityFeed,
+    ToggleCiViewMode,
 }
 
 impl GlimEvent {
@@ -136,6 +141,8 @@ impl GlimEvent {
             GlimEvent::FilterMenuClose => "FilterMenuClose",
             GlimEvent::FilterMenuShow => "FilterMenuShow",
             GlimEvent::FocusToggle => "FocusToggle",
+            GlimEvent::CycleRankingMode => "CycleRankingMode",
+            GlimEvent::RerollStochastic => "RerollStochastic",
             GlimEvent::GlitchOverride(_) => "GlitchOverride",
             GlimEvent::InputKey(_) => "InputKey",
             GlimEvent::InputMouse(_) => "InputMouse",
@@ -160,6 +167,7 @@ impl GlimEvent {
             GlimEvent::PipelinesLoaded(_) => "PipelinesLoaded",
             GlimEvent::ProjectDetailsClose => "ProjectDetailsClose",
             GlimEvent::ProjectDetailsOpen(_) => "ProjectDetailsOpen",
+            GlimEvent::ProjectDetailsOpenWithPipeline(_, _) => "ProjectDetailsOpenWithPipeline",
             GlimEvent::ProjectEventsFetch(_) => "ProjectEventsFetch",
             GlimEvent::ProjectEventsLoaded(_, _) => "ProjectEventsLoaded",
             GlimEvent::ProjectEventsPageFetch(_, _) => "ProjectEventsPageFetch",
@@ -167,6 +175,7 @@ impl GlimEvent {
             GlimEvent::ProjectFetch(_) => "ProjectFetch",
             GlimEvent::ProjectFirst => "ProjectFirst",
             GlimEvent::ProjectLast => "ProjectLast",
+            GlimEvent::ProjectManualRefresh(_) => "ProjectManualRefresh",
             GlimEvent::ProjectNext => "ProjectNext",
             GlimEvent::ProjectOpenUrl(_) => "ProjectOpenUrl",
             GlimEvent::ProjectPageDown => "ProjectPageDown",
@@ -180,6 +189,7 @@ impl GlimEvent {
             GlimEvent::ScreenCaptureToClipboard(_) => "ScreenCaptureToClipboard",
             GlimEvent::TodosLoaded(_) => "TodosLoaded",
             GlimEvent::ToggleActivityFeed => "ToggleActivityFeed",
+            GlimEvent::ToggleCiViewMode => "ToggleCiViewMode",
         }
     }
 }

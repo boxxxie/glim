@@ -10,10 +10,10 @@ use tachyonfx::{Duration, RefRect};
 
 use crate::{
     dispatcher::Dispatcher,
-    domain::Project,
+    domain::{Project, RowEntryTarget},
     effect_registry::EffectRegistry,
     event::GlimEvent,
-    glim_app::{GlimApp, GlimConfig, Modulo},
+    glim_app::{CiViewMode, GlimApp, GlimConfig, Modulo, RankingMode},
     id::{PipelineId, ProjectId},
     ui::{
         popup::{
@@ -56,6 +56,11 @@ pub struct StatefulWidgets {
     pub sender: Sender<GlimEvent>,
     pub project_table_state: TableState,
     pub selected_project_id: Option<ProjectId>,
+    pub ci_view_mode: Option<CiViewMode>,
+    pub ranking_mode: Option<RankingMode>,
+    pub stochastic_nonce: u64,
+    pub current_flat_targets: Vec<(ProjectId, RowEntryTarget, Option<PipelineId>)>,
+    pub selected_flat_target: Option<(ProjectId, RowEntryTarget, Option<PipelineId>)>,
     pub config_popup_state: Option<ConfigPopupState>,
     pub project_details: Option<ProjectDetailsPopupState>,
     pub pipeline_actions: Option<PipelineActionsPopupState>,
@@ -83,6 +88,11 @@ impl StatefulWidgets {
             sender,
             project_table_state: TableState::default().with_selected(0),
             selected_project_id: None,
+            ci_view_mode: None,
+            ranking_mode: None,
+            stochastic_nonce: 0,
+            current_flat_targets: Vec::new(),
+            selected_flat_target: None,
             config_popup_state: None,
             project_details: None,
             pipeline_actions: None,
@@ -102,6 +112,14 @@ impl StatefulWidgets {
             click_regions: Vec::new(),
             current_filtered_indices: Vec::new(),
         }
+    }
+
+    pub fn effective_ci_view_mode(&self, config: &GlimConfig) -> CiViewMode {
+        self.ci_view_mode.unwrap_or(config.ci_view_mode)
+    }
+
+    pub fn effective_ranking_mode(&self, config: &GlimConfig) -> RankingMode {
+        self.ranking_mode.unwrap_or(config.ranking_mode)
     }
 
     pub fn apply(&mut self, app: &GlimApp, effects: &mut EffectRegistry, event: &GlimEvent) {
@@ -164,6 +182,19 @@ impl StatefulWidgets {
                 effects.register_project_details(popup_area.clone());
                 self.open_project_details(
                     app.project(*id).clone(),
+                    None,
+                    popup_area,
+                    app.sender(),
+                    app.config().max_recent_pipelines,
+                    app.config().include_mr_pipelines,
+                )
+            },
+            GlimEvent::ProjectDetailsOpenWithPipeline(id, pid) => {
+                let popup_area = RefRect::default();
+                effects.register_project_details(popup_area.clone());
+                self.open_project_details(
+                    app.project(*id).clone(),
+                    Some(*pid),
                     popup_area,
                     app.sender(),
                     app.config().max_recent_pipelines,
@@ -198,6 +229,25 @@ impl StatefulWidgets {
                 self.show_activity_feed = !self.show_activity_feed;
                 if !self.show_activity_feed {
                     self.activity_feed_focused = false;
+                }
+            },
+            GlimEvent::ToggleCiViewMode => {
+                let next = self.effective_ci_view_mode(app.config()).toggle();
+                self.ci_view_mode = Some(next);
+                *self.project_table_state.offset_mut() = 0;
+                self.project_table_state.select(Some(0));
+            },
+            GlimEvent::CycleRankingMode => {
+                let next = self.effective_ranking_mode(app.config()).cycle();
+                self.ranking_mode = Some(next);
+                self.stochastic_nonce = self.stochastic_nonce.wrapping_add(1);
+                *self.project_table_state.offset_mut() = 0;
+                self.project_table_state.select(Some(0));
+            },
+            GlimEvent::RerollStochastic => {
+                self.stochastic_nonce = self.stochastic_nonce.wrapping_add(1);
+                if self.effective_ranking_mode(app.config()) == RankingMode::Deterministic {
+                    self.ranking_mode = Some(RankingMode::Stochastic);
                 }
             },
 
@@ -241,23 +291,32 @@ impl StatefulWidgets {
     fn open_project_details(
         &mut self,
         project: Project,
+        initial_pipeline_id: Option<PipelineId>,
         area_tracker: RefRect,
         sender: Sender<GlimEvent>,
         max_recent_pipelines: usize,
         include_mr_pipelines: bool,
     ) {
-        project
-            .recent_pipelines(max_recent_pipelines, include_mr_pipelines)
-            .first()
-            .map(|p| sender.dispatch(GlimEvent::PipelineSelected(p.id)))
-            .unwrap_or(());
-
-        self.project_details = Some(ProjectDetailsPopupState::new(
+        let mut state = ProjectDetailsPopupState::new(
             project,
             area_tracker,
             max_recent_pipelines,
             include_mr_pipelines,
-        ));
+        );
+        if let Some(target_pid) = initial_pipeline_id {
+            let recent = state
+                .project
+                .recent_pipelines(max_recent_pipelines, include_mr_pipelines);
+            if let Some(idx) = recent.iter().position(|p| p.id == target_pid) {
+                state.pipelines_table_state.select(Some(idx));
+                state.selected_pipeline_id = Some(target_pid);
+            }
+        }
+        if let Some(pid) = state.selected_pipeline_id {
+            sender.dispatch(GlimEvent::PipelineSelected(pid));
+        }
+
+        self.project_details = Some(state);
     }
 
     fn open_config(&mut self, config: GlimConfig, popup_area: RefRect) {
@@ -322,6 +381,22 @@ impl StatefulWidgets {
     }
 
     fn handle_project_selection(&mut self, direction: i32, app: &GlimApp) {
+        if self.effective_ci_view_mode(app.config()) == CiViewMode::Flat {
+            if self.current_flat_targets.is_empty() {
+                return;
+            }
+            let current = self.project_table_state.selected().unwrap_or(0);
+            let new_index = current
+                .saturating_add_signed(direction as isize)
+                .min(self.current_flat_targets.len().saturating_sub(1));
+            self.project_table_state.select(Some(new_index));
+            let (proj_id, target, pid) = self.current_flat_targets[new_index].clone();
+            self.selected_project_id = Some(proj_id);
+            self.selected_flat_target = Some((proj_id, target, pid));
+            app.dispatch(GlimEvent::ProjectSelected(proj_id));
+            return;
+        }
+
         let all_projects = app.projects();
         let filtered_count = if self.current_filtered_indices.is_empty() {
             all_projects.len()
@@ -356,6 +431,19 @@ impl StatefulWidgets {
     }
 
     fn handle_project_first(&mut self, app: &GlimApp) {
+        if self.effective_ci_view_mode(app.config()) == CiViewMode::Flat {
+            if self.current_flat_targets.is_empty() {
+                return;
+            }
+            *self.project_table_state.offset_mut() = 0;
+            self.project_table_state.select(Some(0));
+            let (proj_id, target, pid) = self.current_flat_targets[0].clone();
+            self.selected_project_id = Some(proj_id);
+            self.selected_flat_target = Some((proj_id, target, pid));
+            app.dispatch(GlimEvent::ProjectSelected(proj_id));
+            return;
+        }
+
         let all_projects = app.projects();
         let filtered_count = if self.current_filtered_indices.is_empty() {
             all_projects.len()
@@ -378,6 +466,19 @@ impl StatefulWidgets {
     }
 
     fn handle_project_last(&mut self, app: &GlimApp) {
+        if self.effective_ci_view_mode(app.config()) == CiViewMode::Flat {
+            if self.current_flat_targets.is_empty() {
+                return;
+            }
+            let last_idx = self.current_flat_targets.len() - 1;
+            self.project_table_state.select(Some(last_idx));
+            let (proj_id, target, pid) = self.current_flat_targets[last_idx].clone();
+            self.selected_project_id = Some(proj_id);
+            self.selected_flat_target = Some((proj_id, target, pid));
+            app.dispatch(GlimEvent::ProjectSelected(proj_id));
+            return;
+        }
+
         let all_projects = app.projects();
         let filtered_count = if self.current_filtered_indices.is_empty() {
             all_projects.len()
@@ -755,6 +856,10 @@ impl StatefulWidgets {
                             self.activity_feed_focused = false;
                             self.project_table_state.select(Some(table_row));
                             self.selected_project_id = Some(project_id);
+                            if let Some(flat_item) = self.current_flat_targets.get(table_row).cloned()
+                            {
+                                self.selected_flat_target = Some(flat_item);
+                            }
                             self.sender.dispatch(GlimEvent::ProjectSelected(project_id));
                             if let Some(ev) = event {
                                 self.sender.dispatch(ev);

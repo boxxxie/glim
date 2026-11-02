@@ -46,16 +46,24 @@ impl Tui {
     where
         F: FnMut(GlimEvent),
     {
-        let mut apply_event = |e| match e {
-            GlimEvent::ProjectsLoaded(p) if p.is_empty() => (),
-            GlimEvent::PipelinesLoaded(p) if p.is_empty() => (),
-            GlimEvent::JobsLoaded(_, _, j) if j.is_empty() => (),
-            _ => f(e),
+        let mut apply_event = |e: GlimEvent| -> bool {
+            let is_exit = matches!(e, GlimEvent::AppExit);
+            match e {
+                GlimEvent::ProjectsLoaded(p) if p.is_empty() => (),
+                GlimEvent::PipelinesLoaded(p) if p.is_empty() => (),
+                GlimEvent::JobsLoaded(_, _, j) if j.is_empty() => (),
+                _ => f(e),
+            }
+            is_exit
         };
 
-        apply_event(self.events.next().unwrap());
+        if apply_event(self.events.next().unwrap()) {
+            return;
+        }
         while let Some(event) = self.events.try_next() {
-            apply_event(event)
+            if apply_event(event) {
+                break;
+            }
         }
     }
 

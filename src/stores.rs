@@ -17,7 +17,7 @@ SET threads=1;
 SET external_threads=1;
 SET async_threads=1;
 SET preserve_insertion_order=false;
-SET memory_limit='8MB';
+SET memory_limit='24MB';
 SET allocator_flush_threshold='512KB';
 SET allocator_bulk_deallocation_flush_threshold='512KB';
 SET wal_autocheckpoint='256KB';
@@ -84,6 +84,17 @@ CREATE TABLE IF NOT EXISTS commits (
     message VARCHAR,
     payload VARCHAR
 );
+CREATE TABLE IF NOT EXISTS user_interactions (
+    id BIGINT PRIMARY KEY,
+    project_id BIGINT,
+    mr_iid BIGINT,
+    branch VARCHAR,
+    pipeline_id BIGINT,
+    kind VARCHAR,
+    weight DOUBLE,
+    created_at VARCHAR,
+    payload VARCHAR
+);
 "#;
 
 use chrono::{DateTime, Utc};
@@ -93,17 +104,19 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{debug, info, instrument, warn};
 
+#[cfg(not(test))]
+use crate::config::default_data_dir;
 use crate::{
-    config::{default_data_dir, default_quack_token_path},
+    config::default_quack_token_path,
     dispatcher::Dispatcher,
     domain::{
         clean_multiline_body, clean_note_body, contains_mention, ActivityKind, CommitDto,
         GitlabEventDto, GitlabTodoDto, Job, MergeRequest, Pipeline, PipelineStatus, Project,
-        ProjectActivityEvent,
+        ProjectActivityEvent, UserInteraction, UserInteractionKind,
     },
     event::GlimEvent,
     glim_app::GlimConfig,
-    id::ProjectId,
+    id::{PipelineId, ProjectId},
     os_notify::{send_os_notification, NotifyUrgency},
 };
 
@@ -173,6 +186,7 @@ enum SqlWorkerMsg {
 pub struct DuckDbHandle {
     sql_tx: Sender<SqlWorkerMsg>,
     pub quack_listen_uri: Option<CompactString>,
+    #[allow(dead_code)]
     pub quack_token: Option<CompactString>,
 }
 
@@ -192,7 +206,7 @@ impl DuckDbHandle {
         }
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         if self.sql_tx.send(SqlWorkerMsg::Shutdown(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_millis(450));
         }
     }
 }
@@ -217,6 +231,8 @@ pub struct ProjectStore {
     last_seen_todo_id: Option<u64>,
     current_username: CompactString,
     recent_activity: Vec<ProjectActivityEvent>,
+    user_interactions: Vec<UserInteraction>,
+    last_select_interaction: Option<(ProjectId, std::time::Instant)>,
     commits: HashMap<CompactString, CommitDto>,
     requested_commits: HashSet<CompactString>,
     startup_notified: bool,
@@ -259,6 +275,8 @@ impl ProjectStore {
             last_seen_todo_id: None,
             current_username: "paul".into(),
             recent_activity: Vec::new(),
+            user_interactions: Vec::new(),
+            last_select_interaction: None,
             commits: HashMap::new(),
             requested_commits: HashSet::new(),
             startup_notified: false,
@@ -277,8 +295,72 @@ impl ProjectStore {
         &self.recent_activity
     }
 
+    pub fn user_interactions(&self) -> &[UserInteraction] {
+        &self.user_interactions
+    }
+
+    pub fn record_interaction(
+        &mut self,
+        project_id: ProjectId,
+        mr_iid: Option<u64>,
+        branch: Option<CompactString>,
+        pipeline_id: Option<PipelineId>,
+        kind: UserInteractionKind,
+    ) {
+        let now = Utc::now();
+        // Resolve branch/mr_iid from project state if not explicitly provided
+        let (resolved_branch, resolved_mr_iid) = if let Some(proj) = self.find(project_id) {
+            let b = branch.or_else(|| {
+                pipeline_id
+                    .and_then(|pid| proj.pipeline(pid))
+                    .map(|p| {
+                        proj.merge_request_for_branch(&p.branch)
+                            .map(|m| m.source_branch.clone())
+                            .unwrap_or_else(|| p.branch.clone())
+                    })
+                    .or_else(|| {
+                        mr_iid
+                            .and_then(|iid| proj.merge_request(iid))
+                            .map(|m| m.source_branch.clone())
+                    })
+            });
+            let m = mr_iid.or_else(|| {
+                b.as_deref()
+                    .and_then(|br| proj.merge_request_for_branch(br))
+                    .map(|mr| mr.iid)
+            });
+            (b, m)
+        } else {
+            (branch, mr_iid)
+        };
+
+        let id = (now.timestamp_millis().max(1) as u64)
+            .wrapping_mul(100)
+            .wrapping_add((project_id.value() as u64) % 97);
+        let interaction = UserInteraction {
+            id,
+            project_id,
+            mr_iid: resolved_mr_iid,
+            branch: resolved_branch,
+            pipeline_id,
+            kind,
+            weight: kind.base_weight(),
+            created_at: now,
+        };
+        let sql = upsert_user_interaction_sql(&interaction);
+        self.user_interactions.insert(0, interaction);
+        if self.user_interactions.len() > 2_000 {
+            self.user_interactions.truncate(2_000);
+        }
+        self.persist_sql(sql);
+    }
+
     pub fn is_loading_more_activity(&self) -> bool {
         !self.loading_more_events.is_empty()
+    }
+
+    pub fn current_username(&self) -> &str {
+        &self.current_username
     }
 
     pub fn find_activity(&self, id: u64) -> Option<&ProjectActivityEvent> {
@@ -391,6 +473,10 @@ impl ProjectStore {
                 .filter(|s| !s.is_empty())
                 .collect();
             if !terms.is_empty() && !terms.iter().any(|term| path_lower.contains(term)) {
+                if self.config.dynamic_relevance && !is_older_than_days(project.last_activity(), 7)
+                {
+                    return true;
+                }
                 return false;
             }
         }
@@ -416,6 +502,13 @@ impl ProjectStore {
             // requests jobs for pipelines that have not been loaded yet, plus fresh MRs & events
             GlimEvent::ProjectDetailsOpen(id) => {
                 debug!(project_id = %id, "Opening project details and requesting missing jobs");
+                self.record_interaction(
+                    *id,
+                    None,
+                    None,
+                    None,
+                    UserInteractionKind::InspectProjectDetails,
+                );
                 let max_recent = self.config.max_recent_pipelines;
                 let include_mr = self.config.include_mr_pipelines;
                 let project = self.find(*id).unwrap();
@@ -427,6 +520,151 @@ impl ProjectStore {
                     .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project_id, p.id)));
                 self.dispatch(GlimEvent::MergeRequestsFetch(project_id));
                 self.dispatch(GlimEvent::ProjectEventsFetch(project_id));
+            },
+            GlimEvent::ProjectDetailsOpenWithPipeline(id, pid) => {
+                debug!(project_id = %id, pipeline_id = %pid, "Opening project details with pipeline selected");
+                self.record_interaction(
+                    *id,
+                    None,
+                    None,
+                    Some(*pid),
+                    UserInteractionKind::InspectProjectDetails,
+                );
+                let max_recent = self.config.max_recent_pipelines;
+                let include_mr = self.config.include_mr_pipelines;
+                let project = self.find(*id).unwrap();
+                let project_id = project.id;
+                project
+                    .recent_pipelines(max_recent, include_mr)
+                    .into_iter()
+                    .filter(|p| p.jobs.is_none())
+                    .for_each(|p| self.dispatch(GlimEvent::JobsFetch(project_id, p.id)));
+                self.dispatch(GlimEvent::MergeRequestsFetch(project_id));
+                self.dispatch(GlimEvent::ProjectEventsFetch(project_id));
+            },
+            GlimEvent::PipelineActionsOpen(project_id, pipeline_id) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    Some(*pipeline_id),
+                    UserInteractionKind::InspectPipelineActions,
+                );
+            },
+            GlimEvent::ActivityDetailsOpen(activity_id) => {
+                if let Some(ev) = self.find_activity(*activity_id).cloned() {
+                    self.record_interaction(
+                        ev.project_id,
+                        ev.mr_iid,
+                        ev.branch.clone(),
+                        None,
+                        UserInteractionKind::InspectActivityDetails,
+                    );
+                    if let Some(sha) = ev.commit_sha {
+                        if !self.commits.contains_key(&sha) {
+                            self.requested_commits.insert(sha.clone());
+                            self.dispatch(GlimEvent::CommitFetch(ev.project_id, sha));
+                        }
+                    }
+                }
+            },
+            GlimEvent::ProjectOpenUrl(project_id) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    None,
+                    UserInteractionKind::OpenProjectWeb,
+                );
+            },
+            GlimEvent::MergeRequestOpenUrl(project_id, mr_iid) => {
+                self.record_interaction(
+                    *project_id,
+                    Some(*mr_iid),
+                    None,
+                    None,
+                    UserInteractionKind::OpenMergeRequestWeb,
+                );
+            },
+            GlimEvent::PipelineOpenUrl(project_id, pipeline_id) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    Some(*pipeline_id),
+                    UserInteractionKind::OpenPipelineWeb,
+                );
+            },
+            GlimEvent::JobOpenUrl(project_id, pipeline_id, _) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    Some(*pipeline_id),
+                    UserInteractionKind::OpenJobWeb,
+                );
+            },
+            GlimEvent::JobLogFetch(project_id, pipeline_id) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    Some(*pipeline_id),
+                    UserInteractionKind::DownloadJobLog,
+                );
+            },
+            GlimEvent::CommitOpenUrl(project_id, _) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    None,
+                    UserInteractionKind::OpenCommitWeb,
+                );
+            },
+            GlimEvent::ProjectManualRefresh(project_id) => {
+                self.record_interaction(
+                    *project_id,
+                    None,
+                    None,
+                    None,
+                    UserInteractionKind::ManualRefresh,
+                );
+            },
+            GlimEvent::ProjectSelected(project_id) => {
+                debug!(project_id = %project_id, "Project selected");
+                let now_inst = std::time::Instant::now();
+                let should_record = match self.last_select_interaction {
+                    Some((prev_id, prev_t)) => {
+                        prev_id != *project_id
+                            && now_inst.duration_since(prev_t).as_secs() >= 3
+                    },
+                    None => false,
+                };
+                self.last_select_interaction = Some((*project_id, now_inst));
+                if should_record {
+                    self.record_interaction(
+                        *project_id,
+                        None,
+                        None,
+                        None,
+                        UserInteractionKind::SelectProject,
+                    );
+                }
+
+                let mut request_pipelines = false;
+                if self.fetched_this_session.insert(*project_id) {
+                    if let Some(project) = self.find_mut(*project_id) {
+                        if project.pipelines.is_none() {
+                            project.pipelines = Some(Vec::new());
+                        }
+                        request_pipelines = true;
+                    }
+                }
+
+                if request_pipelines {
+                    self.dispatch(GlimEvent::PipelinesFetch(*project_id));
+                }
             },
 
             // updates the projects in the store
@@ -639,7 +877,7 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
-                self.save_projects_cache();
+                self.save_single_project_cache(project_id);
             },
 
             // updates open merge requests for a project
@@ -725,7 +963,7 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
-                self.save_projects_cache();
+                self.save_single_project_cache(*project_id);
             },
 
             // updates recent project events (MR opens/merges/comments/pushes)
@@ -977,42 +1215,12 @@ impl ProjectStore {
                 }
 
                 self.sorted = self.projects_sorted_by_last_activity();
-                self.save_projects_cache();
+                self.save_single_project_cache(*project_id);
             },
 
             GlimEvent::CommitLoaded(_project_id, commit_dto) => {
                 if !commit_dto.id.is_empty() {
                     self.apply_commit_details(commit_dto.clone());
-                }
-            },
-
-            GlimEvent::ActivityDetailsOpen(activity_id) => {
-                if let Some((project_id, sha)) = self
-                    .find_activity(*activity_id)
-                    .and_then(|ev| ev.commit_sha.as_ref().map(|s| (ev.project_id, s.clone())))
-                {
-                    if !self.commits.contains_key(&sha) {
-                        self.requested_commits.insert(sha.clone());
-                        self.dispatch(GlimEvent::CommitFetch(project_id, sha));
-                    }
-                }
-            },
-
-            // requests pipelines for a project if they have not been fetched yet this session
-            GlimEvent::ProjectSelected(id) => {
-                debug!(project_id = %id, "Project selected");
-                let mut request_pipelines = false;
-                if self.fetched_this_session.insert(*id) {
-                    if let Some(project) = self.find_mut(*id) {
-                        if project.pipelines.is_none() {
-                            project.pipelines = Some(Vec::new());
-                        }
-                        request_pipelines = true;
-                    }
-                }
-
-                if request_pipelines {
-                    self.dispatch(GlimEvent::PipelinesFetch(*id));
                 }
             },
             _ => {},
@@ -1191,10 +1399,16 @@ impl ProjectStore {
         let cached_events = query_payloads::<ProjectActivityEvent>(duckdb_bin, db_path, &events_sql);
         self.ingest_cached_activity_events(cached_events);
 
+        let interactions_sql =
+            "SELECT payload FROM (SELECT payload, created_at FROM user_interactions ORDER BY rowid DESC LIMIT 2000) ORDER BY created_at DESC;";
+        self.user_interactions =
+            query_payloads::<UserInteraction>(duckdb_bin, db_path, interactions_sql);
+
         info!(
             projects = self.projects.len(),
             commits = self.commits.len(),
             activity_events = self.recent_activity.len(),
+            user_interactions = self.user_interactions.len(),
             "Loaded cached GitLab state from DuckDB 2.0"
         );
     }
@@ -1451,7 +1665,20 @@ impl ProjectStore {
                 }
             }
             drop(stdin);
-            let _ = child.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    },
+                }
+            }
             if let Some(ack) = ack_on_exit {
                 let _ = ack.send(());
             }
@@ -1467,6 +1694,18 @@ impl ProjectStore {
     fn persist_sql(&self, sql: String) {
         if let Some(ref handle) = self.duckdb_handle {
             handle.execute_async(sql);
+        }
+    }
+
+    fn save_single_project_cache(&self, project_id: ProjectId) {
+        if self.duckdb_handle.is_none() {
+            return;
+        }
+        if let Some(p) = self.find(project_id) {
+            let mut sql = String::from("BEGIN TRANSACTION;\n");
+            sql.push_str(&upsert_project_and_children_sql(p));
+            sql.push_str("COMMIT;\n");
+            self.persist_sql(sql);
         }
     }
 
@@ -1579,6 +1818,106 @@ fn upsert_commit_sql(c: &CommitDto) -> String {
         sql_escape(c.message.as_str()),
         sql_escape(&payload)
     )
+}
+
+fn upsert_user_interaction_sql(u: &UserInteraction) -> String {
+    let payload = serde_json::to_string(u).unwrap_or_default();
+    format!(
+        "INSERT OR REPLACE INTO user_interactions (id, project_id, mr_iid, branch, pipeline_id, kind, weight, created_at, payload) VALUES ({}, {}, {}, {}, {}, '{}', {}, '{}', '{}');\n",
+        u.id,
+        u.project_id,
+        sql_opt_u64(u.mr_iid),
+        sql_opt_str(u.branch.as_deref()),
+        sql_opt_u64(u.pipeline_id.map(|p| p.value())),
+        sql_escape(u.kind.label()),
+        u.weight,
+        sql_escape(&u.created_at.to_rfc3339()),
+        sql_escape(&payload)
+    )
+}
+
+pub fn load_readonly_snapshot(
+    config: &GlimConfig,
+) -> (Vec<Project>, Vec<ProjectActivityEvent>, Vec<UserInteraction>) {
+    let duckdb_bin = resolve_duckdb_binary();
+    let db_path = crate::config::default_db_path();
+    let token = load_or_create_quack_token();
+    let quack_prefix = format!(
+        "LOAD quack;\nCREATE SECRET (TYPE quack, TOKEN '{}');\nATTACH 'quack:127.0.0.1:{}' AS glim;\n",
+        sql_escape(&token),
+        config.quack_port
+    );
+
+    let quack_projects_sql = format!(
+        "{quack_prefix}SELECT payload FROM glim.projects LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS};"
+    );
+    let mut projects = query_payloads_in_memory::<Project>(&duckdb_bin, &quack_projects_sql);
+    let (events, interactions) = if !projects.is_empty() {
+        let quack_events_sql =
+            format!("{quack_prefix}SELECT payload FROM glim.activity_events LIMIT 600;");
+        let mut evs =
+            query_payloads_in_memory::<ProjectActivityEvent>(&duckdb_bin, &quack_events_sql);
+        evs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let quack_interactions_sql =
+            format!("{quack_prefix}SELECT payload FROM glim.user_interactions LIMIT 500;");
+        let mut ints =
+            query_payloads_in_memory::<UserInteraction>(&duckdb_bin, &quack_interactions_sql);
+        ints.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        (evs, ints)
+    } else {
+        let projects_sql = format!(
+            "SELECT payload FROM (SELECT payload FROM projects ORDER BY rowid DESC LIMIT {DEFAULT_HYDRATE_MAX_PROJECTS});"
+        );
+        projects = query_payloads::<Project>(&duckdb_bin, &db_path, &projects_sql);
+        let events_sql =
+            "SELECT payload FROM (SELECT payload, created_at FROM activity_events ORDER BY rowid DESC LIMIT 600) ORDER BY created_at DESC;";
+        let evs = query_payloads::<ProjectActivityEvent>(&duckdb_bin, &db_path, events_sql);
+        let interactions_sql =
+            "SELECT payload FROM (SELECT payload, created_at FROM user_interactions ORDER BY rowid DESC LIMIT 500) ORDER BY created_at DESC;";
+        let ints = query_payloads::<UserInteraction>(&duckdb_bin, &db_path, interactions_sql);
+        (evs, ints)
+    };
+
+    projects.sort_by(|a, b| b.last_activity().cmp(&a.last_activity()));
+    (projects, events, interactions)
+}
+
+fn query_payloads_in_memory<T: DeserializeOwned>(duckdb_bin: &Path, sql: &str) -> Vec<T> {
+    let Ok(out) = Command::new(duckdb_bin)
+        .env("MALLOC_ARENA_MAX", "1")
+        .arg("-dark-mode")
+        .arg("-batch")
+        .arg("-json")
+        .arg("-c")
+        .arg(sql)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let last_array_str = match stdout_str.rfind("\n[") {
+        Some(idx) => &stdout_str[idx + 1..],
+        None => stdout_str.as_ref(),
+    };
+
+    let Ok(rows) = serde_json::from_str::<Vec<Value>>(last_array_str.trim()) else {
+        return Vec::new();
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let payload_str = row.get("payload")?.as_str()?;
+            serde_json::from_str::<T>(payload_str).ok()
+        })
+        .collect()
 }
 
 fn query_payloads<T: DeserializeOwned>(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Vec<T> {

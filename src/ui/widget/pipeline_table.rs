@@ -58,9 +58,10 @@ impl PipelineTable {
             rows: pipelines
                 .iter()
                 .map(|p| {
-                    let mr = merge_requests
-                        .iter()
-                        .find(|mr| mr.source_branch == p.branch);
+                    let mr = merge_requests.iter().find(|mr| {
+                        mr.source_branch == p.branch
+                            || crate::relevance::parse_mr_ref_iid(&p.branch) == Some(mr.iid)
+                    });
                     Self::parse_row(p, mr)
                 })
                 .enumerate()
@@ -80,7 +81,9 @@ impl PipelineTable {
             "".to_compact_string()
         };
 
-        let branch_text = branch.to_string();
+        let branch_text = mr
+            .map(|m| m.source_branch.to_string())
+            .unwrap_or_else(|| branch.to_string());
         let second_line = if let Some(mr) = mr {
             let mut spans = vec![
                 Span::from(format!("!{}", mr.iid)).style(theme().mr_iid),

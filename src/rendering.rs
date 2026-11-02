@@ -12,7 +12,7 @@ use crate::{
     domain::{Project, RowEntryTarget},
     effect_registry::EffectRegistry,
     event::GlimEvent,
-    glim_app::GlimApp,
+    glim_app::{CiViewMode, GlimApp},
     theme::theme,
     ui::{
         popup::{ActivityDetailsPopup, ConfigPopup, PipelineActionsPopup, ProjectDetailsPopup},
@@ -53,84 +53,191 @@ fn render_projects_table(
 ) {
     let config = app.config();
     let effective_filter = widget_states.effective_filter(&config.search_filter);
-    let (filtered_projects, filtered_indices) = app.filtered_projects(&effective_filter);
+    let ranking_mode = widget_states.effective_ranking_mode(config);
+    let stochastic_nonce = widget_states.stochastic_nonce;
+    let (filtered_projects, filtered_indices) = app.filtered_projects_with_mode(
+        &effective_filter,
+        ranking_mode,
+        stochastic_nonce,
+    );
     widget_states.update_filtered_indices(filtered_indices);
 
-    if filtered_projects.is_empty() {
-        widget_states.project_table_state.select(None);
-    } else if let Some(sel_id) = widget_states.selected_project_id {
-        if let Some(idx) = filtered_projects.iter().position(|p| p.id == sel_id) {
-            widget_states.project_table_state.select(Some(idx));
-        } else {
-            let clamped = widget_states
-                .project_table_state
-                .selected()
-                .unwrap_or(0)
-                .min(filtered_projects.len() - 1);
-            widget_states.project_table_state.select(Some(clamped));
-            let new_id = filtered_projects[clamped].id;
-            widget_states.selected_project_id = Some(new_id);
-            widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
-        }
-    } else {
-        let idx = widget_states
-            .project_table_state
-            .selected()
-            .unwrap_or(0)
-            .min(filtered_projects.len() - 1);
-        widget_states.project_table_state.select(Some(idx));
-        let new_id = filtered_projects[idx].id;
-        widget_states.selected_project_id = Some(new_id);
-        widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
-    }
+    let now = chrono::Utc::now();
+    let events = app.recent_activity();
+    let interactions = app.user_interactions();
+    let username = app.current_username();
+    let ctx = crate::relevance::RelevanceContext::new(config, events, interactions, username, now)
+        .with_mode(Some(ranking_mode), stochastic_nonce);
+    let compact_ci_mode =
+        config.dynamic_split && widget_states.activity_feed_focused && widget_states.show_activity_feed;
+    let view_mode = widget_states.effective_ci_view_mode(config);
 
-    let show_feed = widget_states.show_activity_feed && config.activity_feed_lines > 0;
-    let min_feed_h = (config.activity_feed_lines + 2).min(area.height.saturating_sub(6));
-    let (projects_area, feed_area) = if show_feed && area.height > 10 {
-        let content_rows: u16 = filtered_projects
-            .iter()
-            .map(|proj| {
-                proj.row_targets_and_height(
-                    config.max_pipelines_per_project,
-                    config.include_mr_pipelines,
-                )
-                .1
-            })
-            .sum();
-        let filter_h = if widget_states.filter_input_active { 3 } else { 0 };
-        let needed_projects_h = content_rows.max(4) + 3 + filter_h;
-        let max_projects_h = area.height.saturating_sub(min_feed_h).max(6);
-        let projects_h = needed_projects_h.min(max_projects_h);
+    let (projects_area, feed_area, row_budgets) = match view_mode {
+        CiViewMode::Grouped => {
+            widget_states.current_flat_targets.clear();
+            widget_states.selected_flat_target = None;
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(projects_h),
-                Constraint::Min(min_feed_h),
-            ])
-            .split(area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (area, None)
+            if filtered_projects.is_empty() {
+                widget_states.project_table_state.select(None);
+            } else if let Some(sel_id) = widget_states.selected_project_id {
+                if let Some(idx) = filtered_projects.iter().position(|p| p.id == sel_id) {
+                    widget_states.project_table_state.select(Some(idx));
+                } else {
+                    let clamped = widget_states
+                        .project_table_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(filtered_projects.len() - 1);
+                    widget_states.project_table_state.select(Some(clamped));
+                    let new_id = filtered_projects[clamped].id;
+                    widget_states.selected_project_id = Some(new_id);
+                    widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
+                }
+            } else {
+                let idx = widget_states
+                    .project_table_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(filtered_projects.len() - 1);
+                widget_states.project_table_state.select(Some(idx));
+                let new_id = filtered_projects[idx].id;
+                widget_states.selected_project_id = Some(new_id);
+                widget_states.sender.dispatch(GlimEvent::ProjectSelected(new_id));
+            }
+
+            let (projects_h, feed_h_opt, budgets) =
+                crate::relevance::compute_dynamic_split_and_budgets(
+                    &filtered_projects,
+                    widget_states.selected_project_id,
+                    area.height,
+                    widget_states.show_activity_feed,
+                    widget_states.activity_feed_focused,
+                    widget_states.filter_input_active,
+                    &ctx,
+                );
+
+            let (p_area, f_area) = if let Some(feed_h) = feed_h_opt {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(projects_h), Constraint::Min(feed_h)])
+                    .split(area);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (area, None)
+            };
+
+            let projects = ProjectsTable::new_dynamic(
+                &filtered_projects,
+                &ctx,
+                &budgets,
+                widget_states.filter_input_active,
+                &widget_states.filter_input_text,
+                compact_ci_mode,
+                !widget_states.activity_feed_focused,
+            );
+            f.render_stateful_widget(
+                projects,
+                p_area,
+                &mut widget_states.project_table_state,
+            );
+
+            (p_area, f_area, budgets)
+        },
+        CiViewMode::Flat => {
+            let flat_entries =
+                crate::relevance::rank_global_ci_runs(&filtered_projects, &ctx, 40);
+            widget_states.current_flat_targets = flat_entries
+                .iter()
+                .map(|item| {
+                    (
+                        item.project.id,
+                        item.entry.target.clone(),
+                        item.entry.pipeline.map(|p| p.id),
+                    )
+                })
+                .collect();
+
+            if widget_states.current_flat_targets.is_empty() {
+                widget_states.project_table_state.select(None);
+                widget_states.selected_flat_target = None;
+            } else {
+                let matched_idx = widget_states
+                    .selected_flat_target
+                    .as_ref()
+                    .and_then(|(sel_proj, sel_target, _)| {
+                        widget_states
+                            .current_flat_targets
+                            .iter()
+                            .position(|(pid, t, _)| pid == sel_proj && t == sel_target)
+                    })
+                    .or_else(|| {
+                        widget_states.selected_project_id.and_then(|sel_proj| {
+                            widget_states
+                                .current_flat_targets
+                                .iter()
+                                .position(|(pid, _, _)| *pid == sel_proj)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        widget_states
+                            .project_table_state
+                            .selected()
+                            .unwrap_or(0)
+                            .min(widget_states.current_flat_targets.len() - 1)
+                    });
+
+                widget_states.project_table_state.select(Some(matched_idx));
+                let chosen = widget_states.current_flat_targets[matched_idx].clone();
+                if widget_states.selected_project_id != Some(chosen.0) {
+                    widget_states.selected_project_id = Some(chosen.0);
+                    widget_states
+                        .sender
+                        .dispatch(GlimEvent::ProjectSelected(chosen.0));
+                }
+                widget_states.selected_flat_target = Some(chosen);
+            }
+
+            let (projects_h, feed_h_opt) = crate::relevance::compute_flat_ci_split(
+                flat_entries.len(),
+                area.height,
+                widget_states.show_activity_feed,
+                widget_states.activity_feed_focused,
+                widget_states.filter_input_active,
+                config,
+                events,
+                now,
+            );
+
+            let (p_area, f_area) = if let Some(feed_h) = feed_h_opt {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(projects_h), Constraint::Min(feed_h)])
+                    .split(area);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (area, None)
+            };
+
+            let flat_table = ProjectsTable::new_flat(
+                &flat_entries,
+                widget_states.filter_input_active,
+                &widget_states.filter_input_text,
+                compact_ci_mode,
+                !widget_states.activity_feed_focused,
+                ranking_mode,
+            );
+            f.render_stateful_widget(
+                flat_table,
+                p_area,
+                &mut widget_states.project_table_state,
+            );
+
+            (p_area, f_area, std::collections::HashMap::new())
+        },
     };
     widget_states.last_feed_area = feed_area;
 
-    let projects = ProjectsTable::new(
-        &filtered_projects,
-        widget_states.filter_input_active,
-        &widget_states.filter_input_text,
-        config.max_pipelines_per_project,
-        config.include_mr_pipelines,
-        !widget_states.activity_feed_focused,
-    );
-    f.render_stateful_widget(
-        projects,
-        projects_area,
-        &mut widget_states.project_table_state,
-    );
-
     if let Some(feed_area) = feed_area {
-        let events = app.recent_activity();
         if events.is_empty() {
             widget_states.activity_selected_index = None;
             widget_states.selected_activity_id = None;
@@ -180,6 +287,9 @@ fn render_projects_table(
         app,
         widget_states,
         &filtered_projects,
+        &row_budgets,
+        &ctx,
+        compact_ci_mode,
         projects_area,
         feed_area,
     );
@@ -218,10 +328,14 @@ fn render_popups(
     update_popup_click_regions(widget_states);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_main_click_regions(
     app: &GlimApp,
     widget_states: &mut StatefulWidgets,
     filtered_projects: &[Project],
+    row_budgets: &std::collections::HashMap<crate::id::ProjectId, usize>,
+    ctx: &crate::relevance::RelevanceContext<'_>,
+    compact_ci_mode: bool,
     projects_area: Rect,
     feed_area: Option<Rect>,
 ) {
@@ -238,73 +352,106 @@ fn update_main_click_regions(
     };
 
     let content_area = table_area.inner(Margin::new(2, 1));
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(16),
-            Constraint::Min(40),
-            Constraint::Percentage(100),
-        ])
-        .spacing(1)
-        .split(content_area);
     let offset = widget_states.project_table_state.offset();
     let mut row_y = content_area.y;
 
-    let project_col_x = cols[1].x;
-    let project_col_w = cols[1].width;
-    let pipeline_col_x = cols[2].x;
-    let pipeline_col_w = cols[2].width;
-
-    for (table_row, proj) in filtered_projects.iter().enumerate().skip(offset) {
-        if row_y >= content_area.bottom() {
-            break;
-        }
-        let (targets, row_height) = proj.row_targets_and_height(
-            config.max_pipelines_per_project,
-            config.include_mr_pipelines,
-        );
-
-        for (line_idx, target) in targets.iter().enumerate() {
-            let line_y = row_y + line_idx as u16;
-            if line_y >= content_area.bottom() {
+    if widget_states.effective_ci_view_mode(config) == CiViewMode::Flat {
+        for (table_row, (proj_id, target, _)) in widget_states
+            .current_flat_targets
+            .clone()
+            .into_iter()
+            .enumerate()
+            .skip(offset)
+        {
+            if row_y >= content_area.bottom() {
                 break;
             }
             let event = match target {
-                RowEntryTarget::MergeRequest(iid) => GlimEvent::MergeRequestOpenUrl(proj.id, *iid),
-                RowEntryTarget::Pipeline(pid) => GlimEvent::PipelineOpenUrl(proj.id, *pid),
+                RowEntryTarget::MergeRequest(iid) => GlimEvent::MergeRequestOpenUrl(proj_id, iid),
+                RowEntryTarget::Pipeline(pid) => GlimEvent::PipelineOpenUrl(proj_id, pid),
             };
-            if pipeline_col_w > 0 {
+            widget_states.click_regions.push(ClickRegion {
+                area: Rect::new(content_area.x, row_y, content_area.width, 1),
+                hover_area: None,
+                action: ClickAction::SelectProjectAndDispatch {
+                    table_row,
+                    project_id: proj_id,
+                    event: Some(event),
+                },
+            });
+            row_y += 1;
+        }
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(16),
+                Constraint::Min(40),
+                Constraint::Percentage(100),
+            ])
+            .spacing(1)
+            .split(content_area);
+
+        let project_col_x = cols[1].x;
+        let project_col_w = cols[1].width;
+        let pipeline_col_x = cols[2].x;
+        let pipeline_col_w = cols[2].width;
+
+        for (table_row, proj) in filtered_projects.iter().enumerate().skip(offset) {
+            if row_y >= content_area.bottom() {
+                break;
+            }
+            let budget = row_budgets
+                .get(&proj.id)
+                .copied()
+                .unwrap_or(config.max_pipelines_per_project);
+            let (targets, row_height) =
+                proj.ranked_targets_and_height(ctx, budget, compact_ci_mode);
+
+            for (line_idx, target) in targets.iter().enumerate() {
+                let line_y = row_y + line_idx as u16;
+                if line_y >= content_area.bottom() {
+                    break;
+                }
+                let event = match target {
+                    RowEntryTarget::MergeRequest(iid) => {
+                        GlimEvent::MergeRequestOpenUrl(proj.id, *iid)
+                    },
+                    RowEntryTarget::Pipeline(pid) => GlimEvent::PipelineOpenUrl(proj.id, *pid),
+                };
+                if pipeline_col_w > 0 {
+                    widget_states.click_regions.push(ClickRegion {
+                        area: Rect::new(pipeline_col_x, line_y, pipeline_col_w, 1),
+                        hover_area: None,
+                        action: ClickAction::SelectProjectAndDispatch {
+                            table_row,
+                            project_id: proj.id,
+                            event: Some(event),
+                        },
+                    });
+                }
+            }
+
+            let visible_h = row_height.min(content_area.bottom().saturating_sub(row_y));
+            if visible_h > 0 {
                 widget_states.click_regions.push(ClickRegion {
-                    area: Rect::new(pipeline_col_x, line_y, pipeline_col_w, 1),
-                    hover_area: None,
+                    area: Rect::new(
+                        content_area.x,
+                        row_y,
+                        cols[0].width + 1 + project_col_w,
+                        visible_h,
+                    ),
+                    hover_area: Some(Rect::new(project_col_x, row_y, project_col_w, visible_h)),
                     action: ClickAction::SelectProjectAndDispatch {
                         table_row,
                         project_id: proj.id,
-                        event: Some(event),
+                        event: Some(GlimEvent::ProjectDetailsOpen(proj.id)),
                     },
                 });
             }
-        }
 
-        let visible_h = row_height.min(content_area.bottom().saturating_sub(row_y));
-        if visible_h > 0 {
-            widget_states.click_regions.push(ClickRegion {
-                area: Rect::new(
-                    content_area.x,
-                    row_y,
-                    cols[0].width + 1 + project_col_w,
-                    visible_h,
-                ),
-                hover_area: Some(Rect::new(project_col_x, row_y, project_col_w, visible_h)),
-                action: ClickAction::SelectProjectAndDispatch {
-                    table_row,
-                    project_id: proj.id,
-                    event: Some(GlimEvent::ProjectDetailsOpen(proj.id)),
-                },
-            });
+            row_y += row_height;
         }
-
-        row_y += row_height;
     }
 
     if let Some(feed_rect) = feed_area {

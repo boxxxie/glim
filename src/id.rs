@@ -19,6 +19,10 @@ impl ProjectId {
     pub fn new(id: u32) -> Self {
         Self { value: id }
     }
+
+    pub fn value(self) -> u64 {
+        self.value as u64
+    }
 }
 
 impl PipelineId {
