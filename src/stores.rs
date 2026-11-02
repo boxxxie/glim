@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -235,7 +236,16 @@ pub struct ProjectStore {
     last_select_interaction: Option<(ProjectId, std::time::Instant)>,
     commits: HashMap<CompactString, CommitDto>,
     requested_commits: HashSet<CompactString>,
+    persisted_project_hashes: HashMap<ProjectId, u64>,
+    persisted_pipeline_hashes: HashMap<u64, u64>,
+    persisted_mr_hashes: HashMap<u64, u64>,
     startup_notified: bool,
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ProjectStore {
@@ -279,6 +289,9 @@ impl ProjectStore {
             last_select_interaction: None,
             commits: HashMap::new(),
             requested_commits: HashSet::new(),
+            persisted_project_hashes: HashMap::new(),
+            persisted_pipeline_hashes: HashMap::new(),
+            persisted_mr_hashes: HashMap::new(),
             startup_notified: false,
         };
         store.init_duckdb_and_load();
@@ -1254,7 +1267,7 @@ impl ProjectStore {
     }
 
     fn apply_commit_details(&mut self, commit: CommitDto) {
-        let mut sql = String::from("BEGIN TRANSACTION;\n");
+        let mut body = String::new();
         for ev in &mut self.recent_activity {
             if ev.commit_sha.as_deref() == Some(commit.id.as_str()) {
                 let mut changed = false;
@@ -1268,29 +1281,64 @@ impl ProjectStore {
                     changed = true;
                 }
                 if changed {
-                    sql.push_str(&upsert_activity_sql(ev));
+                    body.push_str(&upsert_activity_sql(ev));
                 }
             }
         }
-        let is_new_commit = !self.commits.contains_key(&commit.id);
-        if is_new_commit && self.commits.len() >= MAX_IN_MEMORY_COMMITS {
-            if let Some(evict_key) = self.commits.keys().next().cloned() {
-                self.commits.remove(&evict_key);
+        let commit_changed = match self.commits.get(&commit.id) {
+            Some(existing) => {
+                existing.title != commit.title
+                    || existing.message != commit.message
+                    || existing.author_name != commit.author_name
+            },
+            None => true,
+        };
+        if commit_changed {
+            if !self.commits.contains_key(&commit.id) && self.commits.len() >= MAX_IN_MEMORY_COMMITS
+            {
+                if let Some(evict_key) = self.commits.keys().next().cloned() {
+                    self.commits.remove(&evict_key);
+                }
             }
+            body.push_str(&upsert_commit_sql(&commit));
+            self.commits.insert(commit.id.clone(), commit);
         }
-        sql.push_str(&upsert_commit_sql(&commit));
-        sql.push_str("COMMIT;\n");
-        self.persist_sql(sql);
-        self.commits.insert(commit.id.clone(), commit);
+        if !body.is_empty() {
+            let mut sql = String::from("BEGIN TRANSACTION;\n");
+            sql.push_str(&body);
+            sql.push_str("COMMIT;\n");
+            self.persist_sql(sql);
+        }
     }
 
     fn append_and_trim_activity(&mut self, new_events: Vec<ProjectActivityEvent>) {
-        let mut sql = String::from("BEGIN TRANSACTION;\n");
-        for ev in &new_events {
-            sql.push_str(&upsert_activity_sql(ev));
+        if !new_events.is_empty() {
+            let values: Vec<String> = new_events
+                .iter()
+                .map(|ev| {
+                    let payload = serde_json::to_string(ev).unwrap_or_default();
+                    format!(
+                        "({}, {}, '{}', '{}', '{}', {}, {}, {}, '{}', '{}', '{}')",
+                        ev.id,
+                        ev.project_id,
+                        sql_escape(ev.project_name.as_str()),
+                        sql_escape(ev.kind.action_label()),
+                        sql_escape(ev.author.as_str()),
+                        sql_opt_u64(ev.mr_iid),
+                        sql_opt_str(ev.branch.as_deref()),
+                        sql_opt_str(ev.commit_sha.as_deref()),
+                        sql_escape(ev.summary.as_str()),
+                        sql_escape(&ev.created_at.to_rfc3339()),
+                        sql_escape(&payload)
+                    )
+                })
+                .collect();
+            let sql = format!(
+                "BEGIN TRANSACTION;\nINSERT OR REPLACE INTO activity_events (id, project_id, project_name, kind, author, mr_iid, branch, commit_sha, summary, created_at, payload) VALUES {};\nCOMMIT;\n",
+                values.join(", ")
+            );
+            self.persist_sql(sql);
         }
-        sql.push_str("COMMIT;\n");
-        self.persist_sql(sql);
 
         self.recent_activity.extend(new_events);
         self.recent_activity
@@ -1381,6 +1429,7 @@ impl ProjectStore {
         );
         for p in query_payloads::<Project>(duckdb_bin, db_path, &projects_sql) {
             if !self.project_id_lookup.contains_key(&p.id) {
+                self.record_persisted_hashes(&p);
                 self.project_id_lookup.insert(p.id, self.projects.len());
                 self.projects.push(p);
             }
@@ -1697,28 +1746,149 @@ impl ProjectStore {
         }
     }
 
-    fn save_single_project_cache(&self, project_id: ProjectId) {
-        if self.duckdb_handle.is_none() {
-            return;
+    fn record_persisted_hashes(&mut self, proj: &Project) {
+        if let Ok(payload) = serde_json::to_string(proj) {
+            self.persisted_project_hashes
+                .insert(proj.id, hash_str(&payload));
         }
-        if let Some(p) = self.find(project_id) {
-            let mut sql = String::from("BEGIN TRANSACTION;\n");
-            sql.push_str(&upsert_project_and_children_sql(p));
-            sql.push_str("COMMIT;\n");
-            self.persist_sql(sql);
+        if let Some(ref pipelines) = proj.pipelines {
+            for p in pipelines {
+                if let Ok(p_payload) = serde_json::to_string(p) {
+                    self.persisted_pipeline_hashes
+                        .insert(p.id.value(), hash_str(&p_payload));
+                }
+            }
+        }
+        for mr in &proj.merge_requests {
+            if let Ok(mr_payload) = serde_json::to_string(mr) {
+                self.persisted_mr_hashes
+                    .insert(mr.id, hash_str(&mr_payload));
+            }
         }
     }
 
-    fn save_projects_cache(&self) {
+    fn build_dirty_project_sql(&mut self, proj: &Project) -> String {
+        let mut sql = String::new();
+        let payload = serde_json::to_string(proj).unwrap_or_default();
+        let proj_hash = hash_str(&payload);
+        if self.persisted_project_hashes.get(&proj.id) != Some(&proj_hash) {
+            self.persisted_project_hashes.insert(proj.id, proj_hash);
+            let pipeline_count = proj.pipelines.as_ref().map(|v| v.len()).unwrap_or(0);
+            let open_mr_count = proj.merge_requests.len();
+            sql.push_str(&format!(
+                "INSERT OR REPLACE INTO projects (id, path, default_branch, url, last_activity_at, pipeline_count, open_mr_count, payload) VALUES ({}, '{}', '{}', '{}', '{}', {}, {}, '{}');\n",
+                proj.id,
+                sql_escape(proj.path.as_str()),
+                sql_escape(proj.default_branch.as_str()),
+                sql_escape(proj.url.as_str()),
+                sql_escape(&proj.last_activity_at.to_rfc3339()),
+                pipeline_count,
+                open_mr_count,
+                sql_escape(&payload)
+            ));
+        }
+
+        if let Some(ref pipelines) = proj.pipelines {
+            let mut dirty_pipe_values = Vec::new();
+            for p in pipelines {
+                let p_payload = serde_json::to_string(p).unwrap_or_default();
+                let p_hash = hash_str(&p_payload);
+                if self.persisted_pipeline_hashes.get(&p.id.value()) != Some(&p_hash) {
+                    self.persisted_pipeline_hashes.insert(p.id.value(), p_hash);
+                    let status_str = serde_json::to_value(&p.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(ToString::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    dirty_pipe_values.push(format!(
+                        "({}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
+                        p.id.value(),
+                        proj.id,
+                        sql_escape(proj.path.as_str()),
+                        sql_escape(&status_str),
+                        sql_escape(p.source.to_string().as_str()),
+                        sql_escape(p.branch.as_str()),
+                        sql_escape(p.url.as_str()),
+                        sql_escape(&p.created_at.to_rfc3339()),
+                        sql_escape(&p.updated_at.to_rfc3339()),
+                        sql_escape(&p_payload)
+                    ));
+                }
+            }
+            if !dirty_pipe_values.is_empty() {
+                sql.push_str(&format!(
+                    "INSERT OR REPLACE INTO pipelines (id, project_id, project_path, status, source, branch, url, created_at, updated_at, payload) VALUES {};\n",
+                    dirty_pipe_values.join(", ")
+                ));
+            }
+        }
+
+        let mut dirty_mr_values = Vec::new();
+        for mr in &proj.merge_requests {
+            let mr_payload = serde_json::to_string(mr).unwrap_or_default();
+            let mr_hash = hash_str(&mr_payload);
+            if self.persisted_mr_hashes.get(&mr.id) != Some(&mr_hash) {
+                self.persisted_mr_hashes.insert(mr.id, mr_hash);
+                dirty_mr_values.push(format!(
+                    "({}, {}, {}, '{}', '{}', '{}', '{}', '{}', {}, {}, {}, {}, '{}', '{}', '{}', '{}')",
+                    mr.id,
+                    mr.iid,
+                    proj.id,
+                    sql_escape(proj.path.as_str()),
+                    sql_escape(mr.title.as_str()),
+                    sql_escape(mr.state.as_str()),
+                    sql_escape(mr.source_branch.as_str()),
+                    sql_escape(mr.target_branch.as_str()),
+                    if mr.draft { "TRUE" } else { "FALSE" },
+                    if mr.has_conflicts { "TRUE" } else { "FALSE" },
+                    if mr.blocking_discussions_resolved { "TRUE" } else { "FALSE" },
+                    mr.upvotes,
+                    sql_escape(mr.author_username.as_str()),
+                    sql_escape(&mr.updated_at.to_rfc3339()),
+                    sql_escape(mr.url.as_str()),
+                    sql_escape(&mr_payload)
+                ));
+            }
+        }
+        if !dirty_mr_values.is_empty() {
+            sql.push_str(&format!(
+                "INSERT OR REPLACE INTO merge_requests (id, iid, project_id, project_path, title, state, source_branch, target_branch, draft, has_conflicts, blocking_discussions_resolved, upvotes, author_username, updated_at, url, payload) VALUES {};\n",
+                dirty_mr_values.join(", ")
+            ));
+        }
+
+        sql
+    }
+
+    fn save_single_project_cache(&mut self, project_id: ProjectId) {
         if self.duckdb_handle.is_none() {
             return;
         }
-        let mut sql = String::from("BEGIN TRANSACTION;\n");
-        for p in &self.projects {
-            sql.push_str(&upsert_project_and_children_sql(p));
+        if let Some(p) = self.find(project_id).cloned() {
+            let body = self.build_dirty_project_sql(&p);
+            if !body.is_empty() {
+                let mut sql = String::from("BEGIN TRANSACTION;\n");
+                sql.push_str(&body);
+                sql.push_str("COMMIT;\n");
+                self.persist_sql(sql);
+            }
         }
-        sql.push_str("COMMIT;\n");
-        self.persist_sql(sql);
+    }
+
+    fn save_projects_cache(&mut self) {
+        if self.duckdb_handle.is_none() {
+            return;
+        }
+        let projects_snapshot = self.projects.clone();
+        let mut body = String::new();
+        for p in &projects_snapshot {
+            body.push_str(&self.build_dirty_project_sql(p));
+        }
+        if !body.is_empty() {
+            let mut sql = String::from("BEGIN TRANSACTION;\n");
+            sql.push_str(&body);
+            sql.push_str("COMMIT;\n");
+            self.persist_sql(sql);
+        }
     }
 }
 
