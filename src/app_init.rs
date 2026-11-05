@@ -39,7 +39,6 @@ pub async fn initialize_app(
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Glim TUI starting up");
 
     let tui = initialize_terminal(event_handler)?;
-    let widget_states = StatefulWidgets::new(sender.clone());
 
     let (service, poller) =
         create_gitlab_service_and_poller(sender.clone(), config.clone(), debug).await?;
@@ -53,6 +52,7 @@ pub async fn initialize_app(
         log_reload_handle,
         &config,
     );
+    let widget_states = StatefulWidgets::new(sender.clone());
     app.dispatch(GlimEvent::ProjectsFetch);
     if config == GlimConfig::default() {
         app.dispatch(GlimEvent::ConfigOpen);

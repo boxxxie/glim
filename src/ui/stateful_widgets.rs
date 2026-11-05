@@ -83,7 +83,7 @@ pub struct StatefulWidgets {
 
 impl StatefulWidgets {
     pub fn new(sender: Sender<GlimEvent>) -> Self {
-        Self {
+        let mut s = Self {
             last_frame: Duration::default(),
             sender,
             project_table_state: TableState::default().with_selected(0),
@@ -111,6 +111,40 @@ impl StatefulWidgets {
             mouse_position: None,
             click_regions: Vec::new(),
             current_filtered_indices: Vec::new(),
+        };
+        if let Some(reload) = crate::hot_reload::HotReloadState::load_from_env() {
+            s.selected_project_id = reload.selected_project_id;
+            if let Some(pid) = reload.selected_project_id {
+                let _ = s.sender.send(GlimEvent::ProjectSelected(pid));
+            }
+            if let Some(row) = reload.selected_project_row {
+                s.project_table_state.select(Some(row));
+            }
+            s.ci_view_mode = reload.ci_view_mode;
+            s.ranking_mode = reload.ranking_mode;
+            s.show_activity_feed = reload.show_activity_feed;
+            s.activity_feed_focused = reload.activity_feed_focused;
+            s.activity_selected_index = reload.activity_selected_index;
+            s.selected_activity_id = reload.selected_activity_id;
+            s.temporary_filter = reload.temporary_filter;
+            let _ = s.sender.send(GlimEvent::ActivityNotice(
+                "Hot-reloaded glim binary in-place".into(),
+            ));
+        }
+        s
+    }
+
+    pub fn snapshot_hot_reload_state(&self) -> crate::hot_reload::HotReloadState {
+        crate::hot_reload::HotReloadState {
+            selected_project_id: self.selected_project_id,
+            selected_project_row: self.project_table_state.selected(),
+            ci_view_mode: self.ci_view_mode,
+            ranking_mode: self.ranking_mode,
+            show_activity_feed: self.show_activity_feed,
+            activity_feed_focused: self.activity_feed_focused,
+            activity_selected_index: self.activity_selected_index,
+            selected_activity_id: self.selected_activity_id,
+            temporary_filter: self.temporary_filter.clone(),
         }
     }
 

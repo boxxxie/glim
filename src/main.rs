@@ -24,6 +24,7 @@ mod effect_registry;
 mod event;
 mod glim_app;
 mod gruvbox;
+mod hot_reload;
 mod id;
 mod input;
 mod logging;
@@ -267,6 +268,10 @@ fn main() -> Result<()> {
         }
     });
 
+    let binary_watcher = hot_reload::BinaryWatcher::new();
+    let mut last_binary_check = std::time::Instant::now();
+    let mut pending_hot_reload: Option<PathBuf> = None;
+
     while app.is_running() {
         widget_states.last_frame = app.process_timers();
         tui.receive_events(|event| {
@@ -278,11 +283,31 @@ fn main() -> Result<()> {
         }
         tui.draw(|f| render_main_ui(f, &app, &mut widget_states, &mut effects))?;
         tui.set_fast_tick(effects.is_running());
+
+        if last_binary_check.elapsed() >= std::time::Duration::from_millis(1500) {
+            last_binary_check = std::time::Instant::now();
+            if let Some(updated_exe) = binary_watcher.updated_binary_path() {
+                pending_hot_reload = Some(updated_exe);
+                break;
+            }
+        }
     }
+
+    let reload_target = if let Some(updated_exe) = pending_hot_reload {
+        let state_file = widget_states.snapshot_hot_reload_state().save_to_disk()?;
+        Some((updated_exe, state_file))
+    } else {
+        None
+    };
 
     tui.exit()?;
     app.shutdown();
     drop(app);
     rt.shutdown_background();
+
+    if let Some((updated_exe, state_file)) = reload_target {
+        hot_reload::exec_new_binary(&updated_exe, &state_file)?;
+    }
+
     Ok(())
 }
