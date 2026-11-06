@@ -1,5 +1,6 @@
 use std::sync::mpsc::Sender;
 
+use chrono::{DateTime, Utc};
 use compact_str::CompactString;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -75,6 +76,8 @@ pub struct StatefulWidgets {
     pub activity_selected_index: Option<usize>,
     pub selected_activity_id: Option<u64>,
     pub activity_feed_scroll: usize,
+    pub last_ack_activity_ts: Option<DateTime<Utc>>,
+    pub last_window_title: String,
     pub last_feed_area: Option<Rect>,
     pub mouse_position: Option<Position>,
     pub click_regions: Vec<ClickRegion>,
@@ -107,6 +110,8 @@ impl StatefulWidgets {
             activity_selected_index: Some(0),
             selected_activity_id: None,
             activity_feed_scroll: 0,
+            last_ack_activity_ts: None,
+            last_window_title: String::new(),
             last_feed_area: None,
             mouse_position: None,
             click_regions: Vec::new(),
@@ -165,21 +170,38 @@ impl StatefulWidgets {
             GlimEvent::ProjectPageUp => self.handle_project_selection(-5, app),
             GlimEvent::ProjectFirst => self.handle_project_first(app),
             GlimEvent::ProjectLast => self.handle_project_last(app),
-            GlimEvent::ActivityNext => self.handle_activity_selection(1, app),
-            GlimEvent::ActivityPrevious => self.handle_activity_selection(-1, app),
+            GlimEvent::ActivityNext => {
+                self.acknowledge_activity(app);
+                self.handle_activity_selection(1, app);
+            },
+            GlimEvent::ActivityPrevious => {
+                self.acknowledge_activity(app);
+                self.handle_activity_selection(-1, app);
+            },
             GlimEvent::ActivityPageDown => {
+                self.acknowledge_activity(app);
                 let page = self.activity_page_size();
                 self.handle_activity_selection(page, app);
             },
             GlimEvent::ActivityPageUp => {
+                self.acknowledge_activity(app);
                 let page = self.activity_page_size();
                 self.handle_activity_selection(-page, app);
             },
-            GlimEvent::ActivityFirst => self.handle_activity_first(app),
-            GlimEvent::ActivityLast => self.handle_activity_last(app),
+            GlimEvent::ActivityFirst => {
+                self.acknowledge_activity(app);
+                self.handle_activity_first(app);
+            },
+            GlimEvent::ActivityLast => {
+                self.acknowledge_activity(app);
+                self.handle_activity_last(app);
+            },
             GlimEvent::FocusToggle => {
                 if self.show_activity_feed {
                     self.activity_feed_focused = !self.activity_feed_focused;
+                    if self.activity_feed_focused {
+                        self.acknowledge_activity(app);
+                    }
                     if self.activity_feed_focused && self.selected_activity_id.is_none() {
                         let events = app.recent_activity();
                         if !events.is_empty() {
@@ -193,6 +215,7 @@ impl StatefulWidgets {
                 }
             },
             GlimEvent::ActivityDetailsOpen(id) => {
+                self.acknowledge_activity(app);
                 if let Some(ev) = app.activity_event(*id).cloned() {
                     let popup_area = RefRect::default();
                     effects.register_project_details(popup_area.clone());
@@ -796,6 +819,78 @@ impl StatefulWidgets {
         self.current_filtered_indices = indices;
     }
 
+    pub fn acknowledge_activity(&mut self, app: &GlimApp) {
+        let latest = app
+            .recent_activity()
+            .first()
+            .map(|e| e.created_at)
+            .unwrap_or_else(Utc::now);
+        self.last_ack_activity_ts = Some(match self.last_ack_activity_ts {
+            Some(prev) if prev > latest => prev,
+            _ => latest,
+        });
+    }
+
+    pub fn sync_window_title(&mut self, app: &GlimApp, visible_projects: &[Project]) {
+        if self.last_ack_activity_ts.is_none() {
+            let baseline = app
+                .recent_activity()
+                .first()
+                .map(|e| e.created_at)
+                .unwrap_or_else(Utc::now);
+            self.last_ack_activity_ts = Some(baseline);
+        }
+        if self.activity_feed_focused || self.activity_details.is_some() {
+            self.acknowledge_activity(app);
+        }
+
+        let include_mr = app.config().include_mr_pipelines;
+        let max_pipes = app.config().max_pipelines_per_project;
+
+        let mut running_pipelines = 0usize;
+        let mut failed_branches = 0usize;
+        for proj in visible_projects {
+            let branches = proj.first_pipeline_per_branch(
+                max_pipes.max(12),
+                include_mr,
+                |p| p.status.is_active() || p.has_active_jobs(),
+            );
+            for p in branches {
+                if p.status.is_active() || p.has_active_jobs() {
+                    running_pipelines += 1;
+                } else if p.status == crate::domain::PipelineStatus::Failed {
+                    failed_branches += 1;
+                }
+            }
+        }
+
+        let unseen_events = if let Some(ack_ts) = self.last_ack_activity_ts {
+            app.recent_activity()
+                .iter()
+                .take_while(|ev| ev.created_at > ack_ts)
+                .count()
+        } else {
+            0
+        };
+
+        let context_label = self
+            .selected_project_id
+            .and_then(|id| visible_projects.iter().find(|p| p.id == id))
+            .or_else(|| visible_projects.first())
+            .map(|p| p.title());
+
+        let title = crate::os_notify::compute_window_title(
+            running_pipelines,
+            failed_branches,
+            unseen_events,
+            context_label.as_deref(),
+        );
+        if title != self.last_window_title {
+            crate::os_notify::set_terminal_window_title(&title);
+            self.last_window_title = title;
+        }
+    }
+
     fn handle_mouse_event(&mut self, mouse: MouseEvent, app: &GlimApp) {
         let pos = Position::new(mouse.column, mouse.row);
         self.mouse_position = Some(pos);
@@ -904,6 +999,7 @@ impl StatefulWidgets {
                             activity_id,
                             event,
                         } => {
+                            self.acknowledge_activity(app);
                             self.activity_feed_focused = true;
                             self.activity_selected_index = Some(index);
                             self.selected_activity_id = Some(activity_id);

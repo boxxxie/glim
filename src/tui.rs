@@ -2,12 +2,13 @@ use std::{io, panic};
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::Frame;
 
 use crate::{
     event::{EventHandler, GlimEvent},
+    os_notify::set_terminal_window_title,
     result::{GlimError, GlimError::GeneralError},
 };
 
@@ -73,6 +74,7 @@ impl Tui {
 
         crossterm::execute!(io::stderr(), EnterAlternateScreen, EnableMouseCapture)
             .map_err(|_| GeneralError("failed to enter alternate screen".into()))?;
+        set_terminal_window_title("🦊 glim • GitLab");
 
         // Define a custom panic hook to reset the terminal properties.
         // This way, you won't have your terminal messed up if an unexpected error happens.
@@ -94,6 +96,7 @@ impl Tui {
     fn reset() -> Result<(), GlimError> {
         terminal::disable_raw_mode()
             .map_err(|_| GeneralError("failed to disable raw mode".into()))?;
+        let _ = crossterm::execute!(io::stdout(), SetTitle(""));
         crossterm::execute!(io::stderr(), LeaveAlternateScreen, DisableMouseCapture)
             .map_err(|_| GeneralError("failed to leave alternate screen".into()))?;
 

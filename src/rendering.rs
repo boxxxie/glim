@@ -293,6 +293,7 @@ fn render_projects_table(
         projects_area,
         feed_area,
     );
+    widget_states.sync_window_title(app, &filtered_projects);
 }
 
 fn render_popups(
